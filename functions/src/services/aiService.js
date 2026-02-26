@@ -4,7 +4,7 @@ const { getSchedulerContext } = require("../../utils");
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
-// --- LISTA DE PALAVRAS-CHAVE PARA INTERVENÇÃO HUMANA (HITL) ---
+// --- HITL: PALAVRAS-CHAVE PARA INTERVENÇÃO HUMANA ---
 const HUMAN_HANDOFF_KEYWORDS = [
   "falar com humano", "atendente", "falar com pessoa", "humano", "erro", 
   "não estou conseguindo", "burro", "estúpido", "idiota", "human", 
@@ -12,7 +12,7 @@ const HUMAN_HANDOFF_KEYWORDS = [
 ];
 
 /**
- * Auxiliar: Verifica sobreposição de horários (Evita agendamento duplo)
+ * Auxiliar: Verifica sobreposição de horários (Precisão Cirúrgica)
  */
 const isOverlapping = (startA, durationA, startB, durationB) => {
   const aBegin = new Date(startA).getTime();
@@ -24,7 +24,7 @@ const isOverlapping = (startA, durationA, startB, durationB) => {
 
 /**
  * FÁBRICA DE FERRAMENTAS (Tools Factory)
- * Garante que a IA tenha acesso real ao banco de dados Firestore.
+ * Implementação da Verdade de Dados via Firestore
  */
 const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
   return {
@@ -36,7 +36,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
         phone: fromNumber, 
         updatedAt: new Date().toISOString() 
       }, { merge: true });
-      return `SUCCESS: Identity saved as ${args.name}.`;
+      return `SUCCESS: Identity saved. Use the name ${args.name} for this client.`;
     },
 
     update_customer_data: async (args) => {
@@ -46,18 +46,20 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
         phone: fromNumber,
         updatedAt: new Date().toISOString()
       }, { merge: true });
-      return "SUCCESS: CRM profile updated.";
+      return "SUCCESS: CRM updated with preferences/data.";
     },
     
     get_realtime_agenda: async () => {
       const snap = await db.collection("barbers").doc(barberId).collection("appointments").get();
+      if (snap.empty) return "VERDICT: The agenda is currently EMPTY. No appointments found.";
+      
       const appointments = snap.docs.map(doc => ({
           client: doc.data().clientName,
           service: doc.data().serviceName,
-          time: doc.data().startTime,
+          time: doc.data().startTime, // ISO-8601
           duration: doc.data().duration
       }));
-      return JSON.stringify(appointments);
+      return `VERDICT: Current appointments in database: ${JSON.stringify(appointments)}. If a name is not here, it is NOT scheduled.`;
     },
 
     create_appointment: async (args) => {
@@ -99,7 +101,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
             updatedAt: new Date().toISOString()
           }, { merge: true });
           
-          return "SUCCESS: Appointment confirmed in database.";
+          return "SUCCESS: Appointment secured and database updated.";
         });
       } catch (e) { return "ERROR: Transaction failed."; }
     },
@@ -107,17 +109,14 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
     update_appointment: async (args) => {
       const requestedStart = args.newStartTime;
       const ref = db.collection("barbers").doc(barberId).collection("appointments");
-      const nowLocal = new Date(new Date().toLocaleString("en-US", { timeZone: timezone }));
-      if (new Date(requestedStart) < nowLocal) return "ERROR: Past date.";
-
       try {
         return await db.runTransaction(async (transaction) => {
           const snapshot = await transaction.get(ref);
           const userDocs = await transaction.get(ref.where("clientName", "==", args.oldClientName));
-          if (userDocs.empty) return "ERROR: Not found.";
           
-          const sorted = userDocs.docs.sort((a, b) => b.data().startTime.localeCompare(a.data().startTime));
-          const targetDoc = sorted[0];
+          if (userDocs.empty) return "ERROR: No appointment found in database to reschedule.";
+          
+          const targetDoc = userDocs.docs.sort((a, b) => b.data().startTime.localeCompare(a.data().startTime))[0];
           
           let conflictFound = false;
           snapshot.forEach(doc => {
@@ -128,38 +127,39 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
           });
 
           if (conflictFound) return "ERROR: SLOT_OCCUPIED.";
-          transaction.update(targetDoc.ref, { startTime: requestedStart });
-          return "SUCCESS: Rescheduled.";
+          transaction.update(targetDoc.ref, { startTime: requestedStart, updatedAt: new Date().toISOString() });
+          return "SUCCESS: Rescheduled in database.";
         });
-      } catch (e) { return "ERROR: Update failed."; }
+      } catch (e) { return "ERROR: Sync fail."; }
     },
 
     delete_appointment: async (args) => {
       const ref = db.collection("barbers").doc(barberId).collection("appointments");
       const snapshot = await ref.where("clientName", "==", args.clientName).get();
-      if (snapshot.empty) return "ERROR: No appointment found.";
+      if (snapshot.empty) return "ERROR: No appointment found in database for this client.";
+      
       const batch = db.batch();
       snapshot.docs.forEach(doc => batch.delete(doc.ref));
       await batch.commit();
-      return "SUCCESS: Appointment deleted.";
+      return "SUCCESS: Appointment removed from database.";
     }
   };
 };
 
 /**
- * DECLARAÇÃO DE TOOLS (Interface para o Gemini)
+ * DECLARAÇÃO DE FERRAMENTAS
  */
 const toolsDeclaration = [
   { name: "save_client_identity", description: "Registers client name.", parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
-  { name: "update_customer_data", description: "Saves client CRM data (preferences, birthday).", parameters: { type: "object", properties: { preferences: { type: "string" }, notes: { type: "string" }, birthday: { type: "string" } } } },
-  { name: "get_realtime_agenda", description: "Checks available time slots." },
+  { name: "update_customer_data", description: "Saves client CRM data (preferences, notes).", parameters: { type: "object", properties: { preferences: { type: "string" }, notes: { type: "string" }, birthday: { type: "string" } } } },
+  { name: "get_realtime_agenda", description: "Checks the REAL database for busy slots and appointment status. USE THIS TO VERIFY IF AN APPOINTMENT EXISTS." },
   { name: "create_appointment", description: "Persists NEW booking.", parameters: { type: "object", properties: { clientName: { type: "string" }, serviceName: { type: "string" }, startTime: { type: "string" }, price: { type: "number" }, duration: { type: "number" }, notes: { type: "string" } }, required: ["clientName", "serviceName", "startTime", "price", "duration"] } },
   { name: "update_appointment", description: "Reschedules an existing booking.", parameters: { type: "object", properties: { oldClientName: { type: "string" }, newStartTime: { type: "string" } }, required: ["oldClientName", "newStartTime"] } },
   { name: "delete_appointment", description: "Cancels a booking.", parameters: { type: "object", properties: { clientName: { type: "string" } }, required: ["clientName"] } }
 ];
 
 /**
- * LÓGICA PRINCIPAL (ORQUESTRADOR DA IA)
+ * LÓGICA PRINCIPAL
  */
 exports.processMessageWithAI = async ({ 
     barberId, barberData, clientName, messageBody, fromNumber, 
@@ -169,7 +169,7 @@ exports.processMessageWithAI = async ({
     try {
         const chatRef = db.collection("barbers").doc(barberId).collection("chats").doc(fromNumber);
         
-        // 1. DETECÇÃO DE MODO (VOZ vs TEXTO)
+        // 1. CONTEXTO DE MODO (VOZ vs TEXTO)
         const isVoiceMode = messageBody.includes("[PHONE CALL]");
         const userMessage = messageBody.replace(/\[PHONE CALL\]:|\[PHONE CALL CONTEXT\]:/g, "").trim();
 
@@ -178,8 +178,8 @@ exports.processMessageWithAI = async ({
         if (HUMAN_HANDOFF_KEYWORDS.some(keyword => lowerMsg.includes(keyword))) {
             await chatRef.set({ status: 'paused', needsAttention: true, pausedAt: new Date().toISOString(), lastMessage: userMessage }, { merge: true });
             return targetLanguage.includes("Portuguese") 
-                ? "Entendido. Vou pedir para o profissional assumir a conversa agora. Aguarde um momento."
-                : "Understood. I'll ask the professional to take over the conversation. Please wait a moment.";
+                ? "Entendido. Vou pedir para o profissional assumir a conversa. Aguarde um momento."
+                : "Understood. I'll ask the professional to take over. Please wait a moment.";
         }
 
         const chatDoc = await chatRef.get();
@@ -191,53 +191,38 @@ exports.processMessageWithAI = async ({
         const tools = setupTools(db, barberId, timezone, mappingRef, fromNumber);
 
         const servicesSnap = await db.collection("barbers").doc(barberId).collection("services").get();
-        const services = servicesSnap.docs.map((doc) => ({ 
-            name: doc.data().name, 
-            price: doc.data().price, 
-            duration: doc.data().duration 
-        }));
-
-        // LISTA TÉCNICA: O segredo para não perder informações no Dashboard
-        const technicalServicesContext = services.map(s => 
-            `- SERVICE_NAME: "${s.name}" | PRICE: ${s.price} | DURATION: ${s.duration} min`
-        ).join('\n');
+        const services = servicesSnap.docs.map((doc) => ({ name: doc.data().name, price: doc.data().price, duration: doc.data().duration }));
+        const technicalServicesContext = services.map(s => `- SERVICE_NAME: "${s.name}" | PRICE: ${s.price} | DURATION: ${s.duration} min`).join('\n');
 
         const workDays = barberData.settings?.businessHours?.days || [1, 2, 3, 4, 5];
         const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
         const openDaysText = workDays.map(d => dayNames[d]).join(", ");
 
-        // 4. AJUSTE DE PROMPT PARA VOZ vs TEXTO
-        let voiceInstructions = "";
-        if (isVoiceMode) {
-          voiceInstructions = `
-          --- MODO VOZ ATIVADO (AUDIO-ONLY) ---
-          - Você está falando ao telefone. Seja extremamente curto (máx 15 palavras).
-          - Proibido usar emojis, asteriscos (*) ou listas.
-          - Use linguagem falada natural. Em vez de "2024-10-05", diga "cinco de outubro".
-          `;
-        }
+        // 4. CONSTRUÇÃO DO PROMPT DINÂMICO
+        let voiceInstructions = isVoiceMode ? `--- VOICE CALL MODE ---
+- SPEAK SHORT: Max 15 words.
+- NO FORMATTING: No asterisks, no emojis, no markdown.
+- NATURAL SPEECH: Say dates like "October fifth" instead of "2024-10-05".` : "";
 
         const MASTER_PROMPT = `
-You are Schedy AI, the Expert Concierge for "${barberData.barberShopName}".
+You are Schedy AI, the Concierge for "${barberData.barberShopName}".
 Language: ${targetLanguage || "English (US)"}.
 
---- CRITICAL DATA INTEGRITY RULES ---
-1. Use the "SERVICE_NAME" from the list below EXACTLY as it is written when calling the 'create_appointment' tool.
-2. You can translate the service for the client (e.g., "Corte" instead of "Haircut"), but the TOOL call MUST use the original "SERVICE_NAME".
-3. ALWAYS include the correct "DURATION" and "PRICE" from the technical list below in your tool calls.
+--- DATA INTEGRITY RULE (CRITICAL) ---
+1. DO NOT TRUST THE CONVERSATION HISTORY for appointment status. History is only for context.
+2. If the user asks about the status of their booking, or if it was "cancelled" or "confirmed", you MUST call 'get_realtime_agenda' FIRST.
+3. If 'get_realtime_agenda' does not show the appointment, it means it was manually deleted/cancelled by the professional in the Dashboard. In this case, inform the user it is NOT in the system.
+4. Tool outputs override anything you or the user said previously.
 
---- SERVICES BACKOFFICE DATA ---
-${technicalServicesContext}
+--- TECHNICAL RULES ---
+- Use EXACT "SERVICE_NAME" for tool calls.
+- Confimation: Summarize (Service, Date, Time, Price) before calling 'create_appointment'.
 
---- OPERATING RULES ---
+--- BUSINESS INFO ---
+- Services: ${technicalServicesContext}
+- Hours: ${barberData.settings?.businessHours?.open} to ${barberData.settings?.businessHours?.close}.
 - Open Days: ${openDaysText}.
-- Hours: ${barberData.settings?.businessHours?.open || "09:00"} to ${barberData.settings?.businessHours?.close || "18:00"}.
-- Identity: Client is "${clientName || "UNKNOWN"}". If UNKNOWN, you MUST ask and call 'save_client_identity'.
-- Confirmation: Before 'create_appointment', summarize: Service, Date, Time, and Price. Wait for confirmation.
-
---- TIME CONTEXT ---
-- Shop Local Time: ${scheduler.currentTimeLocal}. Today: ${scheduler.hojeLocalISO}.
-- Use 'get_realtime_agenda' before offering slots.
+- Shop Time: ${scheduler.currentTimeLocal}. Today: ${scheduler.hojeLocalISO}.
 
 ${voiceInstructions}
         `;
@@ -250,13 +235,10 @@ ${voiceInstructions}
         });
 
         let history = chatDoc.exists ? chatDoc.data().history : [];
-        const cleanInput = isInitialMessage 
-            ? `Greeting: Client scanned QR code for ${barberData.barberShopName}.` 
-            : userMessage;
-
         const chat = model.startChat({ history });
-        let result = await chat.sendMessage(cleanInput); 
-        
+        const finalInput = isInitialMessage ? `Greeting: Scanned QR code for ${barberData.barberShopName}.` : userMessage;
+
+        let result = await chat.sendMessage(finalInput); 
         let responseText = result.response.text();
         let calls = result.response.functionCalls();
 
@@ -265,31 +247,30 @@ ${voiceInstructions}
         while (calls && calls.length > 0) {
             const responses = [];
             for (const call of calls) {
-                const toolResult = await tools[call.name](call.args);
-                if (toolResult.includes("ERROR")) errorCount++;
-
-                responses.push({ 
-                    functionResponse: { 
-                        name: call.name, 
-                        response: { content: toolResult } 
-                    } 
-                });
+                try {
+                    const toolResult = await tools[call.name](call.args);
+                    if (toolResult.includes("ERROR")) errorCount++;
+                    responses.push({ functionResponse: { name: call.name, response: { content: toolResult } } });
+                } catch (toolErr) {
+                    errorCount++;
+                    responses.push({ functionResponse: { name: call.name, response: { content: "ERROR: Internal tool failure." } } });
+                }
             }
             result = await chat.sendMessage(responses);
             responseText = result.response.text();
             calls = result.response.functionCalls();
         }
 
-        // 7. PAUSA POR ERRO TÉCNICO
+        // 7. PAUSA POR INSTABILIDADE TÉCNICA
         if (errorCount >= 2) {
             await chatRef.update({ status: 'paused', needsAttention: true, pausedReason: 'tool_errors' });
-            return targetLanguage.includes("Portuguese") ? "Estou com dificuldade em acessar a agenda agora. Vou passar para o profissional." : "Agenda sync issue. Handing over to human.";
+            return targetLanguage.includes("Portuguese") 
+              ? "Estou com dificuldade em sincronizar a agenda agora. Vou passar seu contato para o barbeiro." 
+              : "I'm having trouble syncing the schedule. I'll forward your message to the professional.";
         }
 
-        // 8. LIMPEZA PARA VOZ (Sintetizador de Voz amigável)
-        if (isVoiceMode) {
-          responseText = responseText.replace(/\*/g, '').replace(/#/g, '').trim();
-        }
+        // 8. LIMPEZA PARA TTS
+        if (isVoiceMode) responseText = responseText.replace(/\*/g, '').replace(/#/g, '').trim();
 
         // 9. PERSISTÊNCIA DO HISTÓRICO
         await chatRef.set({ 
@@ -303,6 +284,6 @@ ${voiceInstructions}
 
     } catch (error) { 
         console.error("AI SERVICE ERROR:", error);
-        return "Internal sync error. Please try again."; 
+        return "Sync issue. Please try again in 10 seconds."; 
     }
 };
