@@ -6,12 +6,20 @@ import {
   Search, 
   Phone, 
   ExternalLink,
-  Loader2
+  Loader2,
+  AlertCircle,
+  Play,
+  Pause,
+  Headphones
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
-import { listenToChats } from '../services/professionalService';
+import { listenToChats, updateCustomer } from '../services/professionalService';
+import { db } from '../services/firebase';
+import { doc, updateDoc } from 'firebase/firestore';
+import { useAuth } from '../contexts/AuthContext';
 
 export function Messages() {
+  const { profile } = useAuth();
   const [chats, setChats] = useState([]);
   const [selectedChat, setSelectedChat] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -24,50 +32,63 @@ export function Messages() {
       setChats(data);
       setLoading(false);
       
-      // Atualiza o chat selecionado em tempo real sem perder o foco
       if (selectedChat) {
         const updatedSelected = data.find(c => c.id === selectedChat.id);
-        if (updatedSelected) {
-            // Só atualiza se houver nova mensagem para evitar re-render desnecessário
-            if (updatedSelected.history.length !== selectedChat.history.length) {
-                setSelectedChat(updatedSelected);
-            }
+        if (updatedSelected && updatedSelected.history.length !== selectedChat.history.length) {
+            setSelectedChat(updatedSelected);
         }
       }
     });
 
     return () => unsubscribe && unsubscribe();
-  }, [selectedChat]); // Dependência necessária para manter o sync
+  }, [selectedChat]);
 
-  // 2. SCROLL INTELIGENTE: Só desce se o chat mudar ou novas mensagens chegarem
+  // 2. SCROLL INTELIGENTE
   useEffect(() => {
     if (messagesEndRef.current) {
         messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
     }
   }, [selectedChat?.history?.length, selectedChat?.id]);
 
+  // 3. FUNÇÃO PARA RETOMAR IA (HITL REVERSE)
+  const handleResumeAI = async (chatId) => {
+    try {
+      const chatRef = doc(db, 'barbers', profile.id, 'chats', chatId);
+      await updateDoc(chatRef, { 
+        status: 'active', 
+        needsAttention: false,
+        updatedAt: new Date().toISOString()
+      });
+      alert("AI Concierge is back in control of this conversation.");
+    } catch (error) {
+      alert("Error resuming AI.");
+    }
+  };
+
   const filteredChats = chats.filter(c => 
     c.clientName?.toLowerCase().includes(searchTerm.toLowerCase()) ||
     c.id.includes(searchTerm)
   );
 
+  // Auxiliar para detectar se a mensagem foi via telefone
+  const isVoiceMessage = (text) => text?.includes("[PHONE CALL]") || text?.includes("[PHONE CALL CONTEXT]");
+
   return (
     <AppLayout>
-      {/* CONTAINER PRINCIPAL COM ALTURA FIXA E TRAVADA */}
-      <div className="flex flex-col md:flex-row h-[calc(100vh-140px)] bg-barber-black rounded-3xl border border-zinc-800 overflow-hidden shadow-2xl">
+      <div className="flex flex-col md:flex-row h-[calc(100vh-140px)] bg-barber-black rounded-3xl border border-zinc-800 overflow-hidden shadow-2xl relative">
         
         {/* COLUNA ESQUERDA: LISTA DE CLIENTES */}
         <div className={`w-full md:w-80 border-r border-zinc-800 flex flex-col bg-zinc-900/30 ${selectedChat ? 'hidden md:flex' : 'flex'}`}>
           <div className="p-4 border-b border-zinc-800 bg-zinc-900/50">
             <h2 className="text-lg font-black text-white uppercase tracking-tighter flex items-center gap-2 mb-4">
               <MessageSquare className="text-barber-gold" size={20} />
-              Live Chats
+              Conversations
             </h2>
             <div className="relative">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" size={14} />
               <input 
                 type="text" 
-                placeholder="Search messages..." 
+                placeholder="Search by name or phone..." 
                 className="w-full bg-barber-black border border-zinc-800 rounded-lg py-2 pl-9 pr-4 text-xs text-white focus:outline-none focus:border-barber-gold transition-all"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
@@ -79,34 +100,44 @@ export function Messages() {
             {loading ? (
               <div className="flex justify-center p-10"><Loader2 className="animate-spin text-barber-gold" /></div>
             ) : filteredChats.length === 0 ? (
-              <p className="text-center text-zinc-600 text-xs mt-10 font-medium italic">No active conversations found.</p>
+              <p className="text-center text-zinc-600 text-[10px] mt-10 font-black uppercase tracking-widest italic">No chats found.</p>
             ) : (
-              filteredChats.map((chat) => (
-                <button
-                  key={chat.id}
-                  onClick={() => setSelectedChat(chat)}
-                  className={`w-full p-4 flex items-start gap-3 border-b border-zinc-800/50 transition-all hover:bg-barber-gold/5 text-left ${selectedChat?.id === chat.id ? 'bg-barber-gold/10 border-r-4 border-r-barber-gold' : ''}`}
-                >
-                  <div className="w-10 h-10 bg-zinc-800 rounded-full flex-shrink-0 flex items-center justify-center border border-zinc-700 text-barber-gold font-bold text-sm">
-                    {chat.clientName?.charAt(0).toUpperCase() || <User size={16}/>}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex justify-between items-baseline mb-1">
-                      <h4 className={`text-sm font-bold truncate ${selectedChat?.id === chat.id ? 'text-barber-gold' : 'text-white'}`}>
-                        {chat.clientName || chat.id.replace('whatsapp:', '')}
-                      </h4>
-                      <span className="text-[9px] text-zinc-500 whitespace-nowrap ml-2">
-                        {chat.updatedAt ? formatDistanceToNow(new Date(chat.updatedAt), { addSuffix: false }) : 'Now'}
-                      </span>
+              filteredChats.map((chat) => {
+                const lastMsg = chat.history?.[chat.history.length - 1]?.parts[0].text || "";
+                const isPaused = chat.status === 'paused';
+                
+                return (
+                  <button
+                    key={chat.id}
+                    onClick={() => setSelectedChat(chat)}
+                    className={`w-full p-4 flex items-start gap-3 border-b border-zinc-800/50 transition-all hover:bg-zinc-800/80 text-left relative ${selectedChat?.id === chat.id ? 'bg-zinc-800 border-r-4 border-r-barber-gold' : ''}`}
+                  >
+                    <div className={`w-10 h-10 rounded-full flex-shrink-0 flex items-center justify-center border font-black text-xs ${isPaused ? 'bg-red-500/20 text-red-500 border-red-500/40' : 'bg-zinc-800 text-barber-gold border-zinc-700'}`}>
+                      {chat.clientName?.charAt(0).toUpperCase() || <User size={16}/>}
                     </div>
-                    <p className="text-[10px] text-zinc-500 truncate font-medium">
-                        {chat.history && chat.history.length > 0 
-                            ? chat.history[chat.history.length - 1].parts[0].text 
-                            : 'Start of conversation'}
-                    </p>
-                  </div>
-                </button>
-              ))
+                    
+                    <div className="flex-1 min-w-0">
+                      <div className="flex justify-between items-baseline mb-0.5">
+                        <h4 className={`text-sm font-black truncate uppercase italic ${isPaused ? 'text-red-400' : selectedChat?.id === chat.id ? 'text-barber-gold' : 'text-white'}`}>
+                          {chat.clientName || chat.id.replace(/\D/g, '')}
+                        </h4>
+                        <span className="text-[8px] text-zinc-600 font-bold">
+                          {chat.updatedAt ? formatDistanceToNow(new Date(chat.updatedAt), { addSuffix: false }) : 'Now'}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        {isVoiceMessage(lastMsg) && <Phone size={10} className="text-barber-gold shrink-0" />}
+                        <p className="text-[10px] text-zinc-500 truncate font-medium italic">
+                            {lastMsg.replace(/\[PHONE CALL CONTEXT\]:|\[PHONE CALL\]:/g, '') || 'Empty message...'}
+                        </p>
+                      </div>
+                    </div>
+                    {isPaused && (
+                        <div className="absolute top-2 right-2 w-2 h-2 bg-red-500 rounded-full animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.8)]"></div>
+                    )}
+                  </button>
+                );
+              })
             )}
           </div>
         </div>
@@ -116,68 +147,108 @@ export function Messages() {
           {selectedChat ? (
             <>
               {/* Header do Chat */}
-              <div className="p-4 bg-zinc-900 border-b border-zinc-800 flex items-center justify-between shadow-md z-10">
+              <div className="p-4 bg-zinc-900/90 backdrop-blur-md border-b border-zinc-800 flex items-center justify-between shadow-lg z-20">
                 <div className="flex items-center gap-3">
-                   {/* Botão Voltar (Mobile) */}
-                   <button onClick={() => setSelectedChat(null)} className="md:hidden p-2 text-zinc-400 hover:text-white">
-                     ←
-                   </button>
-                   
-                   <div className="w-10 h-10 bg-barber-gold/10 rounded-full flex items-center justify-center text-barber-gold border border-barber-gold/20 font-black">
-                      {selectedChat.clientName?.charAt(0).toUpperCase() || <User size={20} />}
+                   <button onClick={() => setSelectedChat(null)} className="md:hidden p-2 text-zinc-400 hover:text-white">←</button>
+                   <div className="relative">
+                        <div className={`w-10 h-10 rounded-full flex items-center justify-center font-black border-2 ${selectedChat.status === 'paused' ? 'border-red-500 text-red-500 bg-red-500/10' : 'border-barber-gold/30 text-barber-gold bg-barber-gold/5'}`}>
+                            {selectedChat.clientName?.charAt(0).toUpperCase() || <User size={20} />}
+                        </div>
+                        {selectedChat.status === 'paused' && (
+                            <div className="absolute -bottom-1 -right-1 bg-red-500 text-white rounded-full p-0.5 border-2 border-zinc-900">
+                                <Pause size={10} fill="currentColor" />
+                            </div>
+                        )}
                    </div>
                    <div>
-                      <h3 className="text-sm font-black text-white uppercase italic tracking-wide">{selectedChat.clientName || 'Unknown Client'}</h3>
-                      <p className="text-[10px] text-zinc-500 flex items-center gap-1 font-mono">
-                        <Phone size={10} /> {selectedChat.id.replace('whatsapp:', '')}
+                      <h3 className="text-sm font-black text-white uppercase italic tracking-wide flex items-center gap-2">
+                        {selectedChat.clientName || 'Unregistered Client'}
+                        {selectedChat.status === 'paused' && <span className="bg-red-500 text-white text-[8px] px-1.5 py-0.5 rounded font-black tracking-tighter">AI PAUSED</span>}
+                      </h3>
+                      <p className="text-[10px] text-zinc-500 flex items-center gap-1 font-mono font-bold">
+                        <Phone size={10} className="text-barber-gold" /> {selectedChat.id.replace('whatsapp:', '')}
                       </p>
                    </div>
                 </div>
-                <a 
-                  href={`https://wa.me/${selectedChat.id.replace(/\D/g, '')}`} 
-                  target="_blank" 
-                  rel="noreferrer"
-                  className="flex items-center gap-2 bg-green-600/10 text-green-500 px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-green-600 hover:text-white transition-all"
-                >
-                  Open WhatsApp <ExternalLink size={12} />
-                </a>
+
+                <div className="flex items-center gap-2">
+                    {selectedChat.status === 'paused' && (
+                        <button 
+                            onClick={() => handleResumeAI(selectedChat.id)}
+                            className="flex items-center gap-2 bg-barber-gold text-black px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-105 transition-all"
+                        >
+                            <Play size={12} fill="currentColor" /> Resume AI
+                        </button>
+                    )}
+                    <a 
+                      href={`https://wa.me/${selectedChat.id.replace(/\D/g, '')}`} 
+                      target="_blank" rel="noreferrer"
+                      className="hidden sm:flex items-center gap-2 bg-zinc-800 text-zinc-400 px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest hover:text-white transition-all border border-zinc-700"
+                    >
+                      <ExternalLink size={12} /> WhatsApp
+                    </a>
+                </div>
               </div>
 
-              {/* Área de Mensagens (Scroll Independente) */}
-              <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar bg-[url('https://www.transparenttextures.com/patterns/dark-matter.png')]">
-                {selectedChat.history?.map((msg, idx) => (
-                  <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-in slide-in-from-bottom-2 duration-300`}>
-                    <div className={`max-w-[85%] md:max-w-[70%] rounded-2xl p-4 shadow-lg text-sm font-medium leading-relaxed whitespace-pre-wrap ${
-                      msg.role === 'user' 
-                        ? 'bg-barber-gold text-black rounded-tr-none' 
-                        : 'bg-zinc-800 text-zinc-200 rounded-tl-none border border-zinc-700'
-                    }`}>
-                      {msg.parts[0]?.text}
-                    </div>
+              {/* BARRA DE AVISO: INTERVENÇÃO HUMANA NECESSÁRIA */}
+              {selectedChat.status === 'paused' && (
+                  <div className="bg-red-500/10 border-b border-red-500/20 px-6 py-2 flex items-center justify-between animate-in slide-in-from-top duration-300">
+                      <div className="flex items-center gap-2 text-red-400">
+                          <AlertCircle size={14} />
+                          <span className="text-[10px] font-black uppercase tracking-widest italic">Action Required: AI is paused. This client needs manual attention.</span>
+                      </div>
                   </div>
-                ))}
-                <div ref={messagesEndRef} className="h-4" /> {/* Espaço extra no final */}
+              )}
+
+              {/* Área de Mensagens */}
+              <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar bg-[url('https://www.transparenttextures.com/patterns/carbon-fibre.png')]">
+                {selectedChat.history?.map((msg, idx) => {
+                  const isVoice = isVoiceMessage(msg.parts[0]?.text);
+                  const cleanText = msg.parts[0]?.text.replace(/\[PHONE CALL CONTEXT\]:|\[PHONE CALL\]:/g, '').trim();
+
+                  return (
+                    <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in zoom-in duration-300`}>
+                      <div className="flex flex-col gap-1 max-w-[85%] md:max-w-[70%]">
+                        <div className={`relative rounded-2xl p-4 shadow-xl text-sm font-medium leading-relaxed whitespace-pre-wrap ${
+                          msg.role === 'user' 
+                            ? 'bg-barber-gold text-black rounded-tr-none' 
+                            : 'bg-zinc-900 text-zinc-300 rounded-tl-none border border-zinc-800'
+                        }`}>
+                          {isVoice && (
+                            <div className={`flex items-center gap-2 mb-2 text-[9px] font-black uppercase tracking-widest pb-2 border-b ${msg.role === 'user' ? 'border-black/10 text-black/60' : 'border-zinc-800 text-barber-gold'}`}>
+                              <Headphones size={12} /> Voice Transcript
+                            </div>
+                          )}
+                          {cleanText}
+                        </div>
+                        <span className={`text-[8px] font-bold uppercase tracking-widest opacity-40 px-1 ${msg.role === 'user' ? 'text-right' : 'text-left'}`}>
+                          {msg.role === 'user' ? 'Client' : 'Assistant'}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+                <div ref={messagesEndRef} className="h-4" />
               </div>
 
-              {/* Footer Informativo */}
-              <div className="p-3 bg-zinc-900 border-t border-zinc-800 text-center">
-                <p className="text-[9px] text-zinc-600 font-bold uppercase tracking-[0.2em] flex items-center justify-center gap-2">
-                  <span className="relative flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-500 opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-                  </span>
-                  AI Concierge Active • Monitoring Conversation
-                </p>
+              {/* Footer de Status */}
+              <div className="p-3 bg-zinc-900 border-t border-zinc-800 flex items-center justify-center gap-4">
+                  <div className="flex items-center gap-1.5">
+                    <div className={`w-1.5 h-1.5 rounded-full ${selectedChat.status === 'paused' ? 'bg-red-500' : 'bg-green-500 animate-pulse'}`}></div>
+                    <span className="text-[9px] text-zinc-500 font-black uppercase tracking-[0.2em] italic">
+                      {selectedChat.status === 'paused' ? 'Human Operator Required' : 'AI Monitoring Active'}
+                    </span>
+                  </div>
               </div>
             </>
           ) : (
-            <div className="flex-1 flex flex-col items-center justify-center text-center p-10 opacity-50">
-              <div className="w-24 h-24 bg-zinc-900 rounded-full flex items-center justify-center text-zinc-800 mb-6 border-4 border-zinc-800">
-                <MessageSquare size={48} />
+            <div className="flex-1 flex flex-col items-center justify-center text-center p-10">
+              <div className="w-20 h-20 bg-zinc-900 rounded-3xl flex items-center justify-center text-zinc-800 mb-6 border border-zinc-800 shadow-inner rotate-3">
+                <MessageSquare size={40} />
               </div>
-              <h3 className="text-xl font-black text-white uppercase italic tracking-tighter mb-2">Select a Conversation</h3>
-              <p className="text-xs text-zinc-500 font-bold uppercase tracking-widest max-w-xs">
-                Choose a client from the list to view the real-time AI negotiation history.
+              <h3 className="text-xl font-black text-white uppercase italic tracking-tighter mb-1">Command Center</h3>
+              <p className="text-[10px] text-zinc-600 font-black uppercase tracking-[0.2em] max-w-xs leading-loose">
+                Monitor and intervene in global AI negotiations in real-time.
               </p>
             </div>
           )}

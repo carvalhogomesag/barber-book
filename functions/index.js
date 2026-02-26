@@ -3,31 +3,147 @@ const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const admin = require("firebase-admin");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const twilio = require("twilio");
 
 // 1. IMPORTAÇÕES DE CONFIGURAÇÃO
 const { REGION, CONCIERGE_NUMBER } = require("./config");
 
-// 2. CONFIGURAÇÃO DE APIS (Lendo do .env)
+// 2. CONFIGURAÇÃO DE APIS
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// 3. IMPORTAÇÃO DOS CONTROLADORES
+// 3. IMPORTAÇÃO DOS CONTROLADORES E SERVIÇOS
 const { handleIncomingMessage } = require("./src/controllers/webhookController");
+const { processMessageWithAI } = require("./src/services/aiService"); // Importação necessária para a voz usar a IA
 
 admin.initializeApp();
 setGlobalOptions({ region: REGION });
 
 /**
- * WEBHOOK DO WHATSAPP
- * Recebe mensagens e encaminha para o processador de mensagens.
+ * [FUNCIONALIDADE: WHATSAPP WEBHOOK]
+ * Gerencia mensagens de texto e detecções de chamadas via webhookController.
  */
 exports.whatsappWebhook = onRequest(async (req, res) => {
   return handleIncomingMessage(req, res);
 });
 
 /**
- * WEBHOOK DO STRIPE
- * Gerencia a ativação do plano PRO e o pagamento de comissões para parceiros.
+ * [FUNCIONALIDADE: LÓGICA DE VOZ - SAUDAÇÃO INICIAL]
+ * Gera o TwiML para a chamada de retorno quando o cliente atende.
+ */
+exports.voiceLogic = onRequest(async (req, res) => {
+  const { barberId, to } = req.query;
+  const db = admin.firestore();
+  const voiceResponse = new twilio.twiml.VoiceResponse();
+
+  try {
+    const barberDoc = await db.collection('barbers').doc(barberId).get();
+    const barberData = barberDoc.data();
+    const lang = barberData.country === 'BR' ? 'pt-BR' : 'en-US';
+    const barberName = barberData.barberShopName || "the professional";
+
+    // Mensagem Inicial da IA
+    const greeting = lang === 'pt-BR' 
+      ? `Olá! Aqui é a assistente inteligente da ${barberName}. Notei que você ligou agora pouco. Como posso te ajudar com seu agendamento?`
+      : `Hello! This is the AI assistant for ${barberName}. I noticed you called a moment ago. How can I help you with your booking?`;
+
+    voiceResponse.say({ voice: 'Polly.Vitoria', language: lang }, greeting);
+
+    // Captura a resposta do cliente (Speech-to-Text)
+    voiceResponse.gather({
+      input: 'speech',
+      action: `/voiceProcess?barberId=${barberId}`,
+      language: lang,
+      speechTimeout: 'auto'
+    });
+
+    res.type('text/xml').send(voiceResponse.toString());
+  } catch (error) {
+    console.error("Voice Logic Error:", error);
+    res.status(500).send("Error");
+  }
+});
+
+/**
+ * [FUNCIONALIDADE: PROCESSAMENTO DE VOZ - CÉREBRO DA CHAMADA]
+ * Recebe o que o cliente falou, processa via Gemini e responde por voz.
+ */
+exports.voiceProcess = onRequest(async (req, res) => {
+  const { barberId } = req.query;
+  const fromNumber = req.body.From; // Número do cliente
+  const speechResult = req.body.SpeechResult; // Transcrição automática do Twilio
+  
+  const db = admin.firestore();
+  const voiceResponse = new twilio.twiml.VoiceResponse();
+
+  try {
+    const barberDoc = await db.collection('barbers').doc(barberId).get();
+    const barberData = barberDoc.data();
+    const lang = barberData.country === 'BR' ? 'pt-BR' : 'en-US';
+    const voiceId = lang === 'pt-BR' ? 'Polly.Vitoria' : 'Polly.Joanna';
+
+    // Se o Twilio não conseguiu capturar nenhuma fala
+    if (!speechResult) {
+      const retryMsg = lang === 'pt-BR' ? "Desculpe, não consegui ouvir. Poderia repetir?" : "I'm sorry, I couldn't hear you. Could you repeat?";
+      voiceResponse.say({ voice: voiceId, language: lang }, retryMsg);
+      voiceResponse.gather({
+        input: 'speech',
+        action: `/voiceProcess?barberId=${barberId}`,
+        language: lang,
+        speechTimeout: 'auto'
+      });
+      return res.type('text/xml').send(voiceResponse.toString());
+    }
+
+    // Identidade do Cliente (CRM)
+    const mappingRef = db.collection("customer_mappings").doc(fromNumber);
+    const mappingDoc = await mappingRef.get();
+    const clientName = mappingDoc.exists ? mappingDoc.data().clientName : null;
+
+    // Configuração de IA
+    const aiConfigSnap = await db.collection("settings").doc("ai_config").get();
+    const globalAIConfig = aiConfigSnap.exists ? aiConfigSnap.data() : { additionalContext: "" };
+
+    // PROCESSAMENTO PELA MESMA IA DO WHATSAPP
+    const aiResponse = await processMessageWithAI({
+      barberId,
+      barberData,
+      clientName,
+      messageBody: `[PHONE CALL]: ${speechResult}`, // Marcador de contexto de voz
+      fromNumber,
+      db,
+      mappingRef,
+      globalAIConfig,
+      targetLanguage: lang === 'pt-BR' ? 'Portuguese (Brazil)' : 'English (US)',
+      barberTimezone: barberData.timezone || 'UTC',
+      serverTimeISO: new Date().toISOString()
+    });
+
+    // Resposta em Voz para o Cliente
+    voiceResponse.say({ voice: voiceId, language: lang }, aiResponse);
+
+    // Permite que o cliente continue falando (Loop de conversação)
+    voiceResponse.gather({
+      input: 'speech',
+      action: `/voiceProcess?barberId=${barberId}`,
+      language: lang,
+      speechTimeout: 'auto'
+    });
+
+    res.type('text/xml').send(voiceResponse.toString());
+
+  } catch (error) {
+    console.error("Voice Process Critical Error:", error);
+    const errorMsg = "I'm sorry, I'm having a technical problem. I will send you a message on WhatsApp to finish your booking.";
+    voiceResponse.say(errorMsg);
+    res.type('text/xml').send(voiceResponse.toString());
+  }
+});
+
+/**
+ * [FUNCIONALIDADE: WEBHOOK STRIPE]
+ * Gerencia a ativação do plano PRO e o pagamento de comissões.
  */
 exports.stripeWebhook = onRequest(async (req, res) => {
   const event = req.body;
@@ -98,7 +214,8 @@ exports.stripeWebhook = onRequest(async (req, res) => {
 });
 
 /**
- * CRON JOB: VERIFICAÇÃO DE EXPIRAÇÃO DE TRIAL
+ * [FUNCIONALIDADE: CRON JOB TRIAL]
+ * Verificação diária de trial e envio de alertas por e-mail.
  */
 exports.checkTrialExpiration = onSchedule({
   schedule: "0 9 * * *",
@@ -132,19 +249,17 @@ exports.checkTrialExpiration = onSchedule({
 });
 
 /**
- * PROVISIONAMENTO DE NÚMERO (PIVOT: US ONLY)
- * Alterado para forçar apenas o uso de números dos EUA (+1).
+ * [FUNCIONALIDADE: PROVISIONAMENTO US (+1)]
+ * Ativação instantânea do número internacional do Concierge.
  */
 exports.provisionNumber = onCall(async (request) => {
   if (!request.auth) throw new HttpsError('unauthenticated', 'Login required');
-  
-  // A estratégia agora é apenas 'US'. Ignoramos solicitações para outros países.
   const areaCode = request.data?.areaCode || 'random';
   
   try {
     const updatePayload = {
       phone: CONCIERGE_NUMBER.replace('+', ''),
-      numberCountry: 'US', // Hardcoded: Estratégia de Concierge Internacional
+      numberCountry: 'US',
       numberType: 'international_concierge',
       selectedAreaCode: areaCode,
       numberActivatedAt: new Date().toISOString(),
@@ -153,11 +268,7 @@ exports.provisionNumber = onCall(async (request) => {
 
     await admin.firestore().collection('barbers').doc(request.auth.uid).update(updatePayload);
     
-    return { 
-      success: true, 
-      phoneNumber: CONCIERGE_NUMBER,
-      country: 'US'
-    };
+    return { success: true, phoneNumber: CONCIERGE_NUMBER, country: 'US' };
   } catch (error) { 
     console.error("Erro no provisionamento US:", error);
     throw new HttpsError('internal', error.message); 
@@ -165,7 +276,8 @@ exports.provisionNumber = onCall(async (request) => {
 });
 
 /**
- * GERA LINK DO PORTAL DO CLIENTE STRIPE
+ * [FUNCIONALIDADE: BILLING PORTAL]
+ * Gera link para o portal de faturamento Stripe.
  */
 exports.createPortalSession = onCall(async (request) => {
   if (!request.auth) throw new HttpsError('unauthenticated', 'Login required');
@@ -182,36 +294,20 @@ exports.createPortalSession = onCall(async (request) => {
 });
 
 /**
- * AGENTE DE IA DE SUPORTE (PIVOT: REGRAS ANTI-ALUCINAÇÃO)
- * Atualizado com instruções de integridade de dados e âncoras técnicas.
+ * [FUNCIONALIDADE: IA DE SUPORTE]
+ * Agente Gemini para ajuda no Dashboard do profissional.
  */
 exports.supportChat = onCall(async (request) => {
   const { message, history } = request.data;
-  
   if (!message) throw new HttpsError('invalid-argument', 'Message is required');
 
   const selectedModel = process.env.GEMINI_MODEL;
-  if (!selectedModel) {
-    throw new HttpsError('failed-precondition', 'AI Model configuration is missing on server.');
-  }
+  if (!selectedModel) throw new HttpsError('failed-precondition', 'AI Model missing.');
 
   try {
     const model = genAI.getGenerativeModel({ 
       model: selectedModel,
-      systemInstruction: `Você é o Schedy AI Support Agent. Você ajuda profissionais a configurar sua IA de agendamento.
-      
-      REGRAS DE INTEGRIDADE:
-      1. ÂNCORAS DE DATA: Sempre utilize o formato ISO-8601 (YYYY-MM-DD) para processar datas. Hoje é ${new Date().toISOString().split('T')[0]}.
-      2. VERDADE DE DADOS: Priorize informações técnicas sobre o sistema em vez do histórico da conversa.
-      3. ESTRATÉGIA DE TELEFONE: Informe claramente que oferecemos APENAS números dos EUA (+1) para ativação imediata. Isso é o nosso diferencial "Concierge Internacional" para evitar burocracia local em BR ou PT.
-      
-      CONHECIMENTO DO PRODUTO:
-      - Schedy automatiza agendamentos via WhatsApp 24/7.
-      - Planos: $29/mês (US/Global) ou R$97/mês (Brasil).
-      - Trial: 30 dias grátis para novos usuários Pro.
-      - Atendimento: Português e Inglês.
-      
-      POSTURA: Profissional, premium e direto ao ponto. Nunca invente preços ou prazos.`
+      systemInstruction: `Você é o Schedy AI Support Agent. Você ajuda profissionais a configurar sua IA. Hoje é ${new Date().toISOString().split('T')[0]}.`
     });
 
     let cleanHistory = [];
@@ -220,10 +316,6 @@ exports.supportChat = onCall(async (request) => {
         role: h.role === 'model' ? 'model' : 'user',
         parts: [{ text: h.parts[0].text }]
       }));
-
-      while (cleanHistory.length > 0 && cleanHistory[0].role !== 'user') {
-        cleanHistory.shift();
-      }
     }
 
     const chat = model.startChat({ history: cleanHistory });
@@ -231,9 +323,8 @@ exports.supportChat = onCall(async (request) => {
     const response = await result.response;
     
     return { text: response.text() };
-
   } catch (error) {
     console.error("Erro no Support Chat:", error);
-    throw new HttpsError('internal', 'AI Assistant error: ' + error.message);
+    throw new HttpsError('internal', 'AI Assistant error');
   }
 });

@@ -1,12 +1,10 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { GEMINI_API_KEY, GEMINI_MODEL } = require("../../config"); 
-const { generateSystemInstruction } = require("../../prompts"); 
 const { getSchedulerContext } = require("../../utils"); 
-const { logAiInteraction } = require("./loggingService");
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
-// --- LISTA DE PALAVRAS-CHAVE PARA INTERVENÇÃO HUMANA ---
+// --- HITL: LISTA DE PALAVRAS-CHAVE PARA INTERVENÇÃO HUMANA ---
 const HUMAN_HANDOFF_KEYWORDS = [
   "falar com humano", "atendente", "falar com pessoa", "humano", "erro", 
   "não estou conseguindo", "burro", "estúpido", "idiota", "human", 
@@ -14,7 +12,7 @@ const HUMAN_HANDOFF_KEYWORDS = [
 ];
 
 /**
- * Auxiliar: Verifica sobreposição de horários
+ * Auxiliar: Verifica sobreposição de horários (Data Integrity)
  */
 const isOverlapping = (startA, durationA, startB, durationB) => {
   const aBegin = new Date(startA).getTime();
@@ -26,6 +24,7 @@ const isOverlapping = (startA, durationA, startB, durationB) => {
 
 /**
  * Fábrica de Ferramentas (Tools Factory)
+ * MANTIDO: Todas as funcionalidades de escrita e leitura de banco.
  */
 const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
   return {
@@ -37,7 +36,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
         phone: fromNumber, 
         updatedAt: new Date().toISOString() 
       }, { merge: true });
-      return `SUCCESS: Client identity saved globally and in your local database.`;
+      return `SUCCESS: Client identity saved. Client name is ${args.name}.`;
     },
 
     update_customer_data: async (args) => {
@@ -47,7 +46,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
         phone: fromNumber,
         updatedAt: new Date().toISOString()
       }, { merge: true });
-      return "SUCCESS: Customer profile updated with captured information.";
+      return "SUCCESS: Customer profile updated in CRM.";
     },
     
     get_realtime_agenda: async () => {
@@ -86,6 +85,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
           const newDocRef = appointmentsRef.doc();
           transaction.set(newDocRef, { 
             ...args,
+            source: 'ai_concierge',
             createdAt: new Date().toISOString(), 
             status: 'scheduled' 
           });
@@ -99,7 +99,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
             updatedAt: new Date().toISOString()
           }, { merge: true });
           
-          return "SUCCESS: Appointment secured and client CRM updated.";
+          return "SUCCESS: Appointment secured.";
         });
       } catch (e) { return "ERROR: Sync failed."; }
     },
@@ -146,9 +146,10 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
   };
 };
 
+// Declaração das Ferramentas para a IA
 const toolsDeclaration = [
-  { name: "save_client_identity", description: "Registers client name locally and globally.", parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
-  { name: "update_customer_data", description: "Saves client CRM data.", parameters: { type: "object", properties: { preferences: { type: "string" }, notes: { type: "string" }, birthday: { type: "string" } } } },
+  { name: "save_client_identity", description: "Registers client name.", parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
+  { name: "update_customer_data", description: "Saves client CRM data like birthday or notes.", parameters: { type: "object", properties: { preferences: { type: "string" }, notes: { type: "string" }, birthday: { type: "string" } } } },
   { name: "get_realtime_agenda", description: "Checks busy slots." },
   { name: "create_appointment", description: "Persists NEW booking.", parameters: { type: "object", properties: { clientName: { type: "string" }, serviceName: { type: "string" }, startTime: { type: "string" }, price: { type: "number" }, duration: { type: "number" }, notes: { type: "string" } }, required: ["clientName", "serviceName", "startTime", "price", "duration"] } },
   { name: "update_appointment", description: "Reschedules booking.", parameters: { type: "object", properties: { oldClientName: { type: "string" }, newStartTime: { type: "string" } }, required: ["oldClientName", "newStartTime"] } },
@@ -156,25 +157,22 @@ const toolsDeclaration = [
 ];
 
 /**
- * Lógica Principal de Processamento com IA Dinâmica + HITL (Human-in-the-Loop)
+ * Lógica Principal
  */
 exports.processMessageWithAI = async ({ 
-    barberId, 
-    barberData, 
-    clientName, 
-    messageBody, 
-    fromNumber, 
-    isInitialMessage, 
-    db, 
-    mappingRef, 
-    globalAIConfig, 
-    targetLanguage 
+    barberId, barberData, clientName, messageBody, fromNumber, 
+    isInitialMessage, db, mappingRef, globalAIConfig, targetLanguage,
+    barberTimezone, serverTimeISO 
 }) => {
     try {
         const chatRef = db.collection("barbers").doc(barberId).collection("chats").doc(fromNumber);
         
+        // --- DETECÇÃO DE MODO VOZ ---
+        const isVoiceMode = messageBody.includes("[PHONE CALL]");
+        const userMessage = messageBody.replace("[PHONE CALL]:", "").trim();
+
         // --- HITL: VERIFICAÇÃO DE GATILHOS DE PAUSA ---
-        const lowerMsg = messageBody.toLowerCase();
+        const lowerMsg = userMessage.toLowerCase();
         const shouldPause = HUMAN_HANDOFF_KEYWORDS.some(keyword => lowerMsg.includes(keyword));
 
         if (shouldPause) {
@@ -182,145 +180,113 @@ exports.processMessageWithAI = async ({
                 ? "Entendido. Vou pedir para o profissional assumir a conversa. Aguarde um momento."
                 : "Understood. I'll ask the professional to take over. Please wait a moment.";
 
-            // Pausa a automação no banco de dados
             await chatRef.set({ 
                 status: 'paused', 
                 needsAttention: true,
                 pausedAt: new Date().toISOString(),
-                lastMessage: messageBody,
+                lastMessage: userMessage,
                 clientName: clientName || "Client"
             }, { merge: true });
 
             return pausedMessage;
         }
 
-        // --- VERIFICA SE JÁ ESTÁ PAUSADO ---
-        // Se o status já for 'paused', a IA não deve responder nada (silêncio total)
-        // O webhookController deve tratar isso antes, mas verificamos aqui por segurança.
         const chatDoc = await chatRef.get();
-        if (chatDoc.exists && chatDoc.data().status === 'paused') {
-             // Retorna string vazia ou null para indicar silêncio
-             return null; 
-        }
+        if (chatDoc.exists && chatDoc.data().status === 'paused') return null; 
 
-        // --- CONTINUAÇÃO NORMAL DA IA ---
-        const timezone = barberData.timezone || "America/New_York";
+        // --- PREPARAÇÃO DE CONTEXTO ---
+        const timezone = barberTimezone || barberData.timezone || "America/New_York";
         const scheduler = getSchedulerContext(timezone);
         const tools = setupTools(db, barberId, timezone, mappingRef, fromNumber);
 
         const servicesSnap = await db.collection("barbers").doc(barberId).collection("services").get();
         const services = servicesSnap.docs.map((doc) => ({ name: doc.data().name, price: doc.data().price, duration: doc.data().duration }));
-        const servicesMenu = services.map((s, i) => `${i + 1}) ${s.name} — ${barberData.currency || '$'}${s.price} (${s.duration} min)`).join('\n');
+        const servicesMenu = services.map((s, i) => `- ${s.name}: ${barberData.currency || '$'}${s.price} (${s.duration} min)`).join('\n');
 
         const workDays = barberData.settings?.businessHours?.days || [1, 2, 3, 4, 5];
         const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
         const openDaysText = workDays.map(d => dayNames[d]).join(", ");
 
-        const MASTER_PROMPT = `
-You are Schedy AI, the Expert Concierge for "${barberData.barberShopName}".
-Your goal is to manage the schedule while building a rich database of clients for the professional.
-
---- LANGUAGE & TONE ---
-- **PRIMARY LANGUAGE:** ${targetLanguage || "English (US)"}
-- **Tone:** Professional, polite, and efficient.
-- **Adaptability:** If the user speaks another language, switch immediately to match them.
-
---- OPERATING HOURS & RULES ---
-- **Open Days:** ${openDaysText}.
-- **Closed Days:** Do NOT book appointments on days NOT listed above.
-- **Business Hours:** ${barberData.settings?.businessHours?.open || "09:00"} to ${barberData.settings?.businessHours?.close || "18:00"}.
-- **Break Time:** ${barberData.settings?.businessHours?.break || "None"}.
-
---- 1. IDENTITY & CRM (CRITICAL) ---
-- Current Contact Name: ${clientName || "UNKNOWN"}.
-- If Name is "UNKNOWN", ask for it and call 'save_client_identity' immediately.
-- For Third-Party/Kids: Ask for the beneficiary's name and the guardian's name.
-- Proactive Data Mining: Listen for birthdays, style preferences, allergies, or habits. Call 'update_customer_data'.
-
---- 2. TIME & AGENDA ---
-- Current Local Time: ${scheduler.currentTimeLocal}
-- Today's Date: ${scheduler.hojeLocalISO}
-- Date Menu Options:
-${scheduler.dateMenuString}
-- SECURITY: Prohibited from booking in the past. 
-- CONFLICTS: ALWAYS call 'get_realtime_agenda' before suggesting slots.
-
---- 3. FINAL CONFIRMATION (MANDATORY) ---
-- For ANY change, you MUST show a summary (Client, Service, Date, Time, Notes) and wait for confirmation "1" before executing tools.
-
---- SERVICES AVAILABLE ---
-${servicesMenu}
-        `;
-
-        let finalInstruction = MASTER_PROMPT;
-        if (globalAIConfig && globalAIConfig.additionalContext) {
-            finalInstruction += `\n\n--- CUSTOM KNOWLEDGE BASE & ADDITIONAL TRAINING ---\n${globalAIConfig.additionalContext}`;
+        // --- AJUSTE DE PROMPT PARA VOZ ---
+        let voiceInstructions = "";
+        if (isVoiceMode) {
+          voiceInstructions = `
+          --- MODO TELEFONE ATIVADO ---
+          1. FALE CURTO: Suas frases devem ter no máximo 15 palavras.
+          2. SEM FORMATAÇÃO: Nunca use asteriscos, negritos, emojis ou listas.
+          3. NATURALIDADE: Em vez de ler datas como "2024-10-05", diga "cinco de outubro".
+          4. AUDIO-ONLY: Lembre-se que o cliente está ouvindo, não lendo.
+          `;
         }
+
+        const MASTER_PROMPT = `
+You are Schedy AI Concierge for "${barberData.barberShopName}".
+Language: ${targetLanguage || "English (US)"}.
+
+--- OPERATING HOURS ---
+- Open Days: ${openDaysText}.
+- Business Hours: ${barberData.settings?.businessHours?.open || "09:00"} to ${barberData.settings?.businessHours?.close || "18:00"}.
+
+--- CRM & IDENTITY ---
+- Client Name: ${clientName || "UNKNOWN"}. If UNKNOWN, ask for it and call 'save_client_identity'.
+
+--- TIME ---
+- Local Time: ${scheduler.currentTimeLocal}. Today: ${scheduler.hojeLocalISO}.
+- Agenda: Call 'get_realtime_agenda' before suggesting slots.
+
+--- SERVICES ---
+${servicesMenu}
+
+${voiceInstructions}
+        `;
 
         const model = genAI.getGenerativeModel({ 
             model: GEMINI_MODEL, 
-            systemInstruction: finalInstruction,
+            systemInstruction: MASTER_PROMPT + (globalAIConfig?.additionalContext || ""),
             tools: [{ functionDeclarations: toolsDeclaration }]
         });
 
         let history = chatDoc.exists ? chatDoc.data().history : [];
-        const cleanMessageBody = isInitialMessage 
-            ? `Hello! scanned your QR code for ${barberData.barberShopName}. Introduce yourself.` 
-            : messageBody;
+        const cleanInput = isInitialMessage 
+            ? `Hello! scanned QR code for ${barberData.barberShopName}.` 
+            : userMessage;
 
         const chat = model.startChat({ history });
-        const result = await chat.sendMessage(cleanMessageBody); 
+        let result = await chat.sendMessage(cleanInput); 
         
         let responseText = result.response.text();
-        const calls = result.response.functionCalls();
+        let calls = result.response.functionCalls();
 
-        // --- HITL: CONTADOR DE ERROS DE FERRAMENTA ---
+        // Loop de Ferramentas (Chain of Thought)
         let errorCount = 0;
-
-        if (calls && calls.length > 0) {
+        while (calls && calls.length > 0) {
             for (const call of calls) {
                 const toolResult = await tools[call.name](call.args);
-                
-                // Verifica se a ferramenta retornou erro
-                if (toolResult.includes("ERROR")) {
-                    errorCount++;
-                }
+                if (toolResult.includes("ERROR")) errorCount++;
 
                 const finalResult = await chat.sendMessage([{ 
-                    functionResponse: { 
-                        name: call.name, 
-                        response: { content: toolResult } 
-                    } 
+                    functionResponse: { name: call.name, response: { content: toolResult } } 
                 }]);
                 responseText = finalResult.response.text();
+                calls = finalResult.response.functionCalls();
             }
         }
 
-        // --- PAUSA POR EXCESSO DE ERROS ---
+        // --- PAUSA POR ERROS TÉCNICOS ---
         if (errorCount >= 2) {
-            const errorPauseMsg = targetLanguage.includes("Portuguese")
-                ? "Estou tendo dificuldades técnicas para acessar a agenda. Vou encaminhar para o atendimento humano."
-                : "I'm having trouble accessing the schedule. I'll forward this to a human agent.";
-            
-            await chatRef.set({ 
-                status: 'paused', 
-                needsAttention: true,
-                pausedReason: 'tool_errors',
-                pausedAt: new Date().toISOString()
-            }, { merge: true });
-
-            // Substitui a resposta da IA pela mensagem de erro amigável
-            responseText = errorPauseMsg;
+            await chatRef.update({ status: 'paused', needsAttention: true, pausedReason: 'tool_errors' });
+            return targetLanguage.includes("Portuguese") ? "Estou com instabilidade na agenda. Vou passar para o atendimento humano." : "I'm having agenda issues. Switching to human agent.";
         }
 
-        // Persistência do Histórico
+        // --- LIMPEZA DE TEXTO PARA TTS (SINTETIZADOR DE VOZ) ---
+        if (isVoiceMode) {
+          responseText = responseText.replace(/\*/g, '').replace(/#/g, '').trim();
+        }
+
+        // Persistência
         await chatRef.set({ 
-            history: [
-                ...history, 
-                { role: "user", parts: [{ text: messageBody }] }, 
-                { role: "model", parts: [{ text: responseText }] }
-            ],
-            lastMessage: messageBody, 
+            history: [...history, { role: "user", parts: [{ text: userMessage }] }, { role: "model", parts: [{ text: responseText }] }].slice(-20),
+            lastMessage: userMessage, 
             clientName: clientName || "New Client", 
             updatedAt: new Date().toISOString()
         }, { merge: true });
@@ -329,6 +295,6 @@ ${servicesMenu}
 
     } catch (error) { 
         console.error("AI SERVICE ERROR:", error);
-        throw error; 
+        return "System sync issue. Please try again."; 
     }
 };

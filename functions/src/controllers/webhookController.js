@@ -2,7 +2,10 @@ const admin = require("firebase-admin");
 const twilio = require("twilio");
 const { processMessageWithAI } = require("../services/aiService");
 
-// MAPA DE IDIOMAS (Sincronizado com o Core da Schedy)
+// Inicialização do cliente Twilio para chamadas de saída
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const CONCIERGE_NUMBER = process.env.TWILIO_PHONE_NUMBER; // Seu número +1
+
 const LANGUAGE_MAP = {
   'US': 'English (US)',
   'GB': 'English (UK)',
@@ -14,32 +17,26 @@ const LANGUAGE_MAP = {
 };
 
 /**
- * Lógica de Roteamento Multi-Tenant (Switchboard)
- * Responsável por identificar qual profissional o cliente deseja contactar.
+ * Lógica de Roteamento Multi-Tenant
  */
 async function identifyTenant(messageBody, fromNumber, db) {
-  // A IDENTIDADE É BASEADA NO NÚMERO DE TELEFONE (From)
   const mappingRef = db.collection("customer_mappings").doc(fromNumber);
   const mappingDoc = await mappingRef.get();
   
-  // Regex aprimorada para capturar ID ou Ref (Slug) do link do Concierge
-  const idMatch = messageBody.match(/(?:ID:|Ref:)\s*([a-zA-Z0-9-_]+)/i);
+  // Se for uma chamada, o messageBody virá vazio. 
+  // Nesses casos, tentamos identificar o profissional pelo histórico de mapeamento.
+  const idMatch = messageBody ? messageBody.match(/(?:ID:|Ref:)\s*([a-zA-Z0-9-_]+)/i) : null;
   let activeMapping = mappingDoc.exists ? mappingDoc.data() : { tenants: {}, clientName: null };
 
-  // --- CENÁRIO 1: ENTRADA POR LINK/QR CODE (ID EXPLÍCITO) ---
   if (idMatch) {
     const providedId = idMatch[1];
-    
-    // Busca por Slug (URL Amigável) primeiro, depois por ID direto
     const slugQuery = await db.collection("barbers").where("slug", "==", providedId).get();
     const barberId = !slugQuery.empty ? slugQuery.docs[0].id : providedId;
 
     const barberDoc = await db.collection("barbers").doc(barberId).get();
-    if (!barberDoc.exists) return { error: "Professional not found in Schedy database." };
+    if (!barberDoc.exists) return { error: "Not found" };
 
     const bData = barberDoc.data();
-
-    // Persistência: Atualiza o mapeamento deste cliente para este barbeiro
     if (!activeMapping.tenants) activeMapping.tenants = {};
     activeMapping.tenants[barberId] = {
       name: bData.barberShopName || bData.name || "Professional",
@@ -49,164 +46,118 @@ async function identifyTenant(messageBody, fromNumber, db) {
 
     await mappingRef.set(activeMapping, { merge: true });
 
-    return { 
-      barberId, 
-      clientName: activeMapping.clientName, 
-      isInitialMessage: true, 
-      mappingRef,
-      barberData: bData 
-    };
+    return { barberId, clientName: activeMapping.clientName, isInitialMessage: true, mappingRef, barberData: bData };
   }
 
-  // --- CENÁRIO 2: CLIENTE SEM HISTÓRICO NO NÚMERO CONCIERGE ---
   const tenantIds = Object.keys(activeMapping.tenants || {});
-  if (tenantIds.length === 0) {
-    return { needsLink: true };
-  }
+  if (tenantIds.length === 0) return { needsLink: true };
 
-  // --- CENÁRIO 3: APENAS UM PROFISSIONAL VINCULADO ---
   if (tenantIds.length === 1) {
     const barberId = tenantIds[0];
     const barberDoc = await db.collection("barbers").doc(barberId).get();
-    
-    if (!barberDoc.exists) return { needsLink: true };
-
-    return { 
-      barberId, 
-      clientName: activeMapping.clientName, 
-      isInitialMessage: false, 
-      mappingRef,
-      barberData: barberDoc.data()
-    };
+    return { barberId, clientName: activeMapping.clientName, isInitialMessage: false, mappingRef, barberData: barberDoc.data() };
   }
 
-  // --- CENÁRIO 4: MÚLTIPLOS PROFISSIONAIS (SWITCHBOARD) ---
   const lastActiveId = activeMapping.lastActiveBarberId;
-  const lastInteractionTime = activeMapping.tenants[lastActiveId]?.lastInteraction;
-  const lastTime = lastInteractionTime ? new Date(lastInteractionTime) : new Date(0);
-  const diffMinutes = (new Date() - lastTime) / (1000 * 60);
-
-  // Se interagiu nos últimos 30 min, assume que continua com o mesmo
-  if (diffMinutes < 30 && lastActiveId) {
+  if (lastActiveId) {
     const barberDoc = await db.collection("barbers").doc(lastActiveId).get();
-    if (barberDoc.exists) {
-        return { 
-          barberId: lastActiveId, 
-          clientName: activeMapping.clientName, 
-          isInitialMessage: false, 
-          mappingRef,
-          barberData: barberDoc.data()
-        };
-    }
+    return { barberId: lastActiveId, clientName: activeMapping.clientName, isInitialMessage: false, mappingRef, barberData: barberDoc.data() };
   }
 
-  // Lógica de escolha numérica (1, 2, 3...)
-  const choice = parseInt(messageBody.trim());
-  if (!isNaN(choice) && choice > 0 && choice <= tenantIds.length) {
-    const selectedId = tenantIds[choice - 1];
-    await mappingRef.update({ lastActiveBarberId: selectedId });
-    const barberDoc = await db.collection("barbers").doc(selectedId).get();
-    return { 
-      barberId: selectedId, 
-      clientName: activeMapping.clientName, 
-      isInitialMessage: false, 
-      mappingRef,
-      barberData: barberDoc.data()
-    };
-  }
-
-  return { 
-    needsChoice: true, 
-    tenantList: tenantIds.map(id => ({ id, name: activeMapping.tenants[id].name })) 
-  };
+  return { needsChoice: true, tenantList: tenantIds.map(id => ({ id, name: activeMapping.tenants[id].name })) };
 }
 
 /**
- * Controlador Principal do Webhook (Twilio Entry Point)
+ * Controlador Principal
  */
 exports.handleIncomingMessage = async (req, res) => {
-  const messageBody = req.body.Body || "";
-  const fromNumber = req.body.From;
   const db = admin.firestore();
   const twiml = new twilio.twiml.MessagingResponse();
-
-  // ÂNCORA TÉCNICA DE DATA (ISO-8601)
-  // Essencial para evitar que a IA se perca em fusos horários diferentes do servidor
-  const serverTimeISO = new Date().toISOString();
+  const fromNumber = req.body.From;
+  const messageBody = req.body.Body || "";
+  
+  // DETECÇÃO DE CHAMADA (WhatsApp ou Voz Direta)
+  // Se existir CallSid ou se não houver Body, mas houver From, tratamos como tentativa de voz
+  const isCall = req.body.CallSid || (!req.body.Body && req.body.From);
 
   try {
     const result = await identifyTenant(messageBody, fromNumber, db);
 
-    // 1. Cliente novo sem identificação de profissional
-    if (result.needsLink) {
-      twiml.message("Welcome to Schedy! 🤖\nPlease use the official booking link provided by your barber to start your appointment.");
-      return res.status(200).type("text/xml").send(twiml.toString());
-    }
-
-    // 2. Menu Switchboard para múltiplos profissionais
-    if (result.needsChoice) {
-      const menuText = result.tenantList
-        .map((t, i) => `${i + 1}) ${t.name}`)
-        .join("\n");
+    if (isCall) {
+      console.log(`[VOICE EVENT] Tentativa de chamada detectada de: ${fromNumber}`);
       
-      twiml.message(`Hello! 🤖\nWho would you like to book with today?\n\n${menuText}\n\nReply with the number of your choice.`);
+      // Se identificamos o barbeiro, enviamos a mensagem de retorno
+      if (result.barberId && result.barberData) {
+        const barberName = result.barberData.barberShopName || "the professional";
+        const lang = result.barberData.country === 'BR' ? 'pt' : 'en';
+
+        const msg = lang === 'pt' 
+            ? `Olá! Notei sua chamada para ${barberName}. 🤖 Vou te ligar de volta em 10 segundos para agendarmos seu horário!`
+            : `Hello! I noticed your call for ${barberName}. 🤖 I'll call you back in 10 seconds to handle your booking!`;
+
+        // Envia WhatsApp de resposta imediata
+        await twilioClient.messages.create({
+            body: msg,
+            from: `whatsapp:${CONCIERGE_NUMBER}`,
+            to: fromNumber
+        });
+
+        // DISPARA A LIGAÇÃO DE RETORNO (Outbound)
+        // A URL aponta para uma função que gera o TwiML da conversa
+        await twilioClient.calls.create({
+            url: `https://${process.env.PROJECT_ID}.web.app/voice-logic?barberId=${result.barberId}&to=${fromNumber}`,
+            to: fromNumber.replace('whatsapp:', ''), // Remove o prefixo se for chamada PSTN
+            from: CONCIERGE_NUMBER
+        });
+      }
+      return res.status(200).send("Call intent handled.");
+    }
+
+    // --- SEGUE O FLUXO NORMAL DE TEXTO ---
+    if (result.needsLink) {
+      twiml.message("Welcome! 🤖\nPlease use the booking link from your professional to start.");
       return res.status(200).type("text/xml").send(twiml.toString());
     }
 
-    // 3. Validação de segurança
-    if (result.error || !result.barberId) {
-      twiml.message("Professional not found. Please verify the booking link.");
+    if (result.needsChoice) {
+      twiml.message("Hello! 🤖\nWho would you like to book with today?\n" + result.tenantList.map((t, i) => `${i + 1}) ${t.name}`).join("\n"));
       return res.status(200).type("text/xml").send(twiml.toString());
     }
 
-    // 4. Verificação de Status do Plano
     if (result.barberData.plan !== 'pro') {
-      twiml.message("Schedy: This professional's AI Concierge is currently offline. Please contact the shop directly.");
+      twiml.message("Schedy: This assistant is currently offline.");
       return res.status(200).type("text/xml").send(twiml.toString());
     }
 
-    // 5. Configurações Globais da IA
+    // Processamento normal com IA (Gemini)
     const aiConfigSnap = await db.collection("settings").doc("ai_config").get();
-    const globalAIConfig = aiConfigSnap.exists 
-      ? aiConfigSnap.data() 
-      : { systemPrompt: "", additionalContext: "" };
+    const globalAIConfig = aiConfigSnap.exists ? aiConfigSnap.data() : { additionalContext: "" };
 
-    // 6. Persistência de Atividade
-    // Garante que o sistema lembre do último profissional e atualize o timestamp de interação
-    const updateData = {
-        lastActiveBarberId: result.barberId,
-        [`tenants.${result.barberId}.lastInteraction`]: admin.firestore.FieldValue.serverTimestamp()
-    };
-    await result.mappingRef.update(updateData);
-
-    // 7. Determinação de Idioma e Fuso Horário
-    const barberCountry = result.barberData.country || 'US';
-    const targetLanguage = LANGUAGE_MAP[barberCountry] || 'English (US)';
-    const barberTimezone = result.barberData.timezone || 'UTC';
-
-    // 8. PROCESSAMENTO VIA AI SERVICE (A "Mente" do Concierge)
     const responseText = await processMessageWithAI({
       barberId: result.barberId,
-      barberData: result.barberData, // Dados do Firestore (VERDADE DE DADOS)
-      clientName: result.clientName, // Identidade Persistente
+      barberData: result.barberData,
+      clientName: result.clientName,
       messageBody,
       fromNumber,
       isInitialMessage: result.isInitialMessage,
       db,
       mappingRef: result.mappingRef,
       globalAIConfig,
-      targetLanguage,
-      barberTimezone,
-      serverTimeISO // Âncora para aritmética de datas
+      targetLanguage: LANGUAGE_MAP[result.barberData.country || 'US'],
+      barberTimezone: result.barberData.timezone || 'UTC',
+      serverTimeISO: new Date().toISOString()
     });
 
     twiml.message(responseText);
     res.status(200).type("text/xml").send(twiml.toString());
 
   } catch (error) {
-    console.error("CRITICAL WEBHOOK ERROR:", error);
-    // Mensagem de fallback genérica e segura
-    twiml.message("Our AI Concierge is taking a short breath. 🤖\nPlease try again in a few seconds.");
-    res.status(200).type("text/xml").send(twiml.toString());
+    console.error("WEBHOOK ERROR:", error);
+    if (!isCall) {
+        twiml.message("Sorry, I'm a bit busy. Try again in a second! 🤖");
+        res.status(200).type("text/xml").send(twiml.toString());
+    } else {
+        res.status(500).send("Error");
+    }
   }
 };
