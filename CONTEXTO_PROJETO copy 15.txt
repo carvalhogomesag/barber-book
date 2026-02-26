@@ -1,0 +1,3539 @@
+
+*** SYSTEM INSTRUCTION PARA CONTINUIDADE DO PROJETO BARBER BOOK ***
+
+CONTEXTO DO PROJETO:
+Você está recebendo o código fonte de um SaaS de gestão para barbearias (Barber Book).
+O sistema é um WebApp (React/Vite) integrado com Firebase (Auth, Firestore, Functions).
+
+FUNCIONALIDADES JÁ IMPLEMENTADAS:
+1. Multi-tenant: Barbeiros criam contas e têm dados isolados.
+2. Agenda Visual: Drag & Drop, visualização diária.
+3. IA no WhatsApp: Um robô (Gemini via Cloud Functions + Twilio) que atende clientes, lê a agenda e cria agendamentos reais.
+4. Pagamentos: Integração com Stripe (Webhooks) para ativar plano PRO.
+5. Internacionalização: Suporte a Brasil (R$) e Portugal (€).
+
+MUDANÇA DE ESTRATÉGIA (PIVOT) - SUA MISSÃO AGORA:
+Decidimos simplificar a oferta de números de telefone.
+- ANTES: Tentávamos comprar números locais (BR/PT) via Twilio.
+- AGORA: Vamos oferecer APENAS números dos Estados Unidos (+1) como um serviço de "Concierge Internacional".
+- MOTIVO: Evitar burocracia de documentos (Regulatory Bundles) e ativar o número instantaneamente.
+
+SUAS PRÓXIMAS TAREFAS:
+1. Analisar o arquivo 'functions/index.js' e alterar a função 'provisionNumber' para buscar apenas números 'US' (Estados Unidos), ignorando DDDs brasileiros.
+2. Analisar 'src/pages/SetupPro.jsx' e remover a solicitação de DDD brasileiro. O usuário deve apenas escolher um "Código de Área Internacional" (ex: 305 Miami, 212 NY) ou gerar um aleatório dos EUA.
+
+SEGUE ABAIXO O CÓDIGO FONTE ATUAL DO PROJETO:
+
+
+================================================================
+INÍCIO DOS ARQUIVOS DO PROJETO
+================================================================
+
+
+
+--- ARQUIVO: functions/index.js ---
+```javascript
+const { onRequest, onCall, HttpsError } = require("firebase-functions/v2/https");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { setGlobalOptions } = require("firebase-functions/v2");
+const admin = require("firebase-admin");
+const { GoogleGenerativeAI } = require("@google/generative-ai"); // Importação para o Suporte IA
+
+// 1. IMPORTAÇÕES DE CONFIGURAÇÃO
+const { REGION, CONCIERGE_NUMBER } = require("./config");
+
+// 2. CONFIGURAÇÃO DE APIS (Lendo do .env)
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// 3. IMPORTAÇÃO DOS CONTROLADORES
+const { handleIncomingMessage } = require("./src/controllers/webhookController");
+
+admin.initializeApp();
+setGlobalOptions({ region: REGION });
+
+/**
+ * WEBHOOK DO WHATSAPP (Preservado)
+ */
+exports.whatsappWebhook = onRequest(async (req, res) => {
+  return handleIncomingMessage(req, res);
+});
+
+/**
+ * WEBHOOK DO STRIPE (Preservado com Lógica de Comissões)
+ */
+exports.stripeWebhook = onRequest(async (req, res) => {
+  const event = req.body;
+  const db = admin.firestore();
+  
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const barberId = session.client_reference_id;
+    if (!barberId) return res.status(400).send('No ID');
+    
+    try {
+      const now = new Date();
+      const trialEndsAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+      await db.collection('barbers').doc(barberId).update({ 
+        plan: 'pro',
+        proActivatedAt: now.toISOString(),
+        trialExpiresAt: trialEndsAt.toISOString(),
+        subscriptionStatus: 'trialing',
+        stripeCustomerId: session.customer,
+        customerEmail: session.customer_details?.email || null 
+      });
+
+      const barberDoc = await db.collection('barbers').doc(barberId).get();
+      const barberData = barberDoc.data();
+
+      if (barberData.referredBy) {
+        const salesSnapshot = await db.collection('salespeople').where('referralCode', '==', barberData.referredBy).limit(1).get();
+        if (!salesSnapshot.empty) {
+          await salesSnapshot.docs[0].ref.update({ activeClients: admin.firestore.FieldValue.increment(1) });
+        }
+      }
+      return res.status(200).send('Success');
+    } catch (error) { return res.status(500).send('Error'); }
+  } 
+  
+  if (event.type === 'invoice.paid') {
+    const invoice = event.data.object;
+    const customerId = invoice.customer;
+    const amountPaid = invoice.amount_paid / 100;
+
+    try {
+      const barberSnapshot = await db.collection('barbers').where('stripeCustomerId', '==', customerId).limit(1).get();
+      if (!barberSnapshot.empty) {
+        const barberData = barberSnapshot.docs[0].data();
+        if (barberData.referredBy) {
+          const salesSnapshot = await db.collection('salespeople').where('referralCode', '==', barberData.referredBy).limit(1).get();
+          if (!salesSnapshot.empty) {
+            const commission = amountPaid * 0.20;
+            await salesSnapshot.docs[0].ref.update({ 
+                totalEarnings: admin.firestore.FieldValue.increment(commission),
+                currentBalance: admin.firestore.FieldValue.increment(commission) 
+            });
+            await db.collection('commissions_log').add({
+              salespersonId: salesSnapshot.docs[0].id,
+              barberName: barberData.name,
+              amountPaid: amountPaid,
+              commissionEarned: commission,
+              date: new Date().toISOString()
+            });
+          }
+        }
+      }
+      return res.status(200).send('Commission Processed');
+    } catch (error) { return res.status(500).send('Error'); }
+  }
+  return res.status(200).send('Ignored');
+});
+
+/**
+ * CRON JOB: VERIFICAÇÃO DE EXPIRAÇÃO DE TRIAL (Preservado)
+ */
+exports.checkTrialExpiration = onSchedule({
+  schedule: "0 9 * * *",
+  timeZone: "America/Sao_Paulo",
+  memory: "256MiB"
+}, async (event) => {
+  const db = admin.firestore();
+  const targetDate = new Date();
+  targetDate.setDate(targetDate.getDate() + 2);
+  const targetDateStr = targetDate.toISOString().split('T')[0];
+  const snapshot = await db.collection('barbers')
+    .where('trialExpiresAt', '>=', `${targetDateStr}T00:00:00`)
+    .where('trialExpiresAt', '<=', `${targetDateStr}T23:59:59`)
+    .where('subscriptionStatus', '==', 'trialing').get();
+
+  if (snapshot.empty) return null;
+  const emailPromises = [];
+  snapshot.forEach(doc => {
+    const data = doc.data();
+    if (data.customerEmail) {
+      emailPromises.push(db.collection('mail').add({
+        to: data.customerEmail,
+        message: {
+          subject: "Action Required: Your Schedy AI trial ends in 48 hours!",
+          html: `<h2>Hello, ${data.name}!</h2><p>Your trial ends in 2 days.</p>`
+        }
+      }));
+    }
+  });
+  return Promise.all(emailPromises);
+});
+
+/**
+ * PROVISIONAMENTO DE NÚMERO (Preservado)
+ */
+exports.provisionNumber = onCall(async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Login required');
+  const areaCode = request.data?.areaCode || 'random';
+  try {
+    await admin.firestore().collection('barbers').doc(request.auth.uid).update({
+      phone: CONCIERGE_NUMBER.replace('+', ''),
+      numberCountry: 'US', 
+      numberType: 'international_concierge',
+      selectedAreaCode: areaCode,
+      numberActivatedAt: new Date().toISOString()
+    });
+    return { success: true, phoneNumber: CONCIERGE_NUMBER };
+  } catch (error) { throw new HttpsError('internal', error.message); }
+});
+
+/**
+ * GERA LINK DO PORTAL DO CLIENTE (Preservado)
+ */
+exports.createPortalSession = onCall(async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Login required');
+  try {
+    const userDoc = await admin.firestore().collection('barbers').doc(request.auth.uid).get();
+    const userData = userDoc.data();
+    if (!userData || !userData.stripeCustomerId) throw new HttpsError('not-found', 'No Stripe ID');
+    const session = await stripe.billingPortal.sessions.create({
+      customer: userData.stripeCustomerId,
+      return_url: 'https://barber-book-d4a5a.web.app/billing', 
+    });
+    return { url: session.url };
+  } catch (error) { throw new HttpsError('internal', error.message); }
+});
+
+/**
+ * AGENTE DE IA DE SUPORTE (NOVO)
+ * Treinado para responder dúvidas de Profissionais e Parceiros.
+ */
+exports.supportChat = onCall(async (request) => {
+  const { message, history } = request.data;
+  
+  if (!message) throw new HttpsError('invalid-argument', 'Message is required');
+
+  const model = genAI.getGenerativeModel({ 
+    model: "gemini-1.5-flash",
+    systemInstruction: `You are the Schedy AI Support Agent. Your goal is to help Professionals (Barbers/Stylists) and Sales Partners.
+    
+    CORE KNOWLEDGE:
+    - Product: AI Concierge that automates WhatsApp bookings 24/7.
+    - Pricing: $29/month for Global/US, R$97/month for Brazil.
+    - Trial: 30-day Free Trial for new Pro users.
+    - Phone Strategy: We use US (+1) numbers for INSTANT activation and global stability. No local bureaucracy.
+    - Partner Program: Partners earn 20% recurring commission on every referred Pro subscription.
+    - Payouts: Minimum withdrawal is $10.00 via PayPal, Wise, or Bank Transfer.
+    - Security: GDPR/LGPD compliant. Personal chats are private; AI only sees booking requests.
+    
+    TONE: Professional, premium, helpful, and concise. Use emojis sparingly.
+    If you don't know an answer, ask the user to email support@schedy.ai.`
+  });
+
+  try {
+    const chat = model.startChat({ history: history || [] });
+    const result = await chat.sendMessage(message);
+    const response = await result.response;
+    return { text: response.text() };
+  } catch (error) {
+    console.error("Support Chat Error:", error);
+    throw new HttpsError('internal', 'AI Assistant is temporarily unavailable.');
+  }
+});
+```
+
+
+--- ARQUIVO: functions/package.json ---
+```javascript
+{
+  "name": "functions",
+  "description": "Cloud Functions for Firebase",
+  "scripts": {
+    "serve": "firebase emulators:start --only functions",
+    "shell": "firebase functions:shell",
+    "start": "npm run shell",
+    "deploy": "firebase deploy --only functions",
+    "logs": "firebase functions:log"
+  },
+  "engines": {
+    "node": "22"
+  },
+  "main": "index.js",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "dotenv": "^17.2.4",
+    "firebase-admin": "^13.6.0",
+    "firebase-functions": "^7.0.5",
+    "stripe": "^20.3.1",
+    "twilio": "^5.12.0"
+  },
+  "devDependencies": {
+    "firebase-functions-test": "^3.4.1"
+  },
+  "private": true
+}
+
+```
+
+
+--- ARQUIVO: src/services/firebase.js ---
+```javascript
+import { initializeApp } from "firebase/app";
+import { getAuth } from "firebase/auth";
+import { getFirestore } from "firebase/firestore";
+import { getFunctions } from "firebase/functions";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyAXgcYUT1D-bK-AFjMgA_Q6ceBFmc0AtDQ",
+  authDomain: "barber-book-d4a5a.firebaseapp.com",
+  projectId: "barber-book-d4a5a",
+  storageBucket: "barber-book-d4a5a.firebasestorage.app",
+  messagingSenderId: "18598107835",
+  appId: "1:18598107835:web:30d12d855328a880afa79e"
+};
+
+// 1. Inicializa o App
+const app = initializeApp(firebaseConfig);
+
+// 2. Exporta o app e os serviços
+export const auth = getAuth(app);
+export const db = getFirestore(app);
+export const functions = getFunctions(app, 'us-central1');
+export { app }; // <--- ESSA LINHA É CRUCIAL
+```
+
+
+--- ARQUIVO: src/services/barberService.js (NÃO ENCONTRADO) ---
+
+
+--- ARQUIVO: src/services/adminService.js ---
+```javascript
+import { db } from './firebase';
+import { 
+  collection, 
+  getDocs, 
+  doc, 
+  setDoc,
+  updateDoc, 
+  deleteDoc, 
+  query, 
+  where,
+  orderBy,
+  addDoc
+} from 'firebase/firestore';
+
+const BARBERS_COLLECTION = 'barbers'; 
+const SUBSCRIPTIONS_COLLECTION = 'subscriptions'; 
+const SALESPEOPLE_COLLECTION = 'salespeople'; 
+const PAYOUTS_COLLECTION = 'payouts'; // Nova coleção para gerir os pedidos de saque
+
+// ==========================================
+// GESTÃO DE PROFISSIONAIS (TENANTS)
+// ==========================================
+
+export const getAllTenants = async () => {
+  const q = query(collection(db, BARBERS_COLLECTION), orderBy("createdAt", "desc"));
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map(doc => ({
+    id: doc.id,
+    ...doc.data()
+  }));
+};
+
+export const adminUpdateTenant = async (tenantId, data) => {
+  const docRef = doc(db, BARBERS_COLLECTION, tenantId);
+  await updateDoc(docRef, data);
+};
+
+export const adminDeleteTenant = async (tenantId) => {
+  await deleteDoc(doc(db, BARBERS_COLLECTION, tenantId));
+};
+
+// ==========================================
+// GESTÃO COMERCIAL (VENDEDORES / AFILIADOS)
+// ==========================================
+
+export const createSalesperson = async (data) => {
+  const newSalesRef = doc(collection(db, SALESPEOPLE_COLLECTION));
+  
+  const salespersonData = {
+    ...data,
+    role: 'sales',
+    commissionRate: 0.20,
+    totalEarnings: 0,   // Ganhos históricos
+    currentBalance: 0,  // Saldo disponível para saque (NOVO)
+    activeClients: 0,
+    createdAt: new Date().toISOString(),
+    status: 'active'
+  };
+
+  await setDoc(newSalesRef, salespersonData);
+  return { id: newSalesRef.id, ...salespersonData };
+};
+
+export const getAllSalespeople = async () => {
+  const q = query(collection(db, SALESPEOPLE_COLLECTION), orderBy("createdAt", "desc"));
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map(doc => ({
+    id: doc.id,
+    ...doc.data()
+  }));
+};
+
+export const getClientsBySalesperson = async (salespersonCode) => {
+  const q = query(
+    collection(db, BARBERS_COLLECTION), 
+    where("referredBy", "==", salespersonCode)
+  );
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map(doc => ({
+    id: doc.id,
+    ...doc.data()
+  }));
+};
+
+// ==========================================
+// GESTÃO DE SAQUES (PAYOUTS) - NOVO
+// ==========================================
+
+/**
+ * Busca todos os pedidos de saque (pendentes e pagos) para o Admin.
+ */
+export const getAllPayoutRequests = async () => {
+  const q = query(collection(db, PAYOUTS_COLLECTION), orderBy("createdAt", "desc"));
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map(doc => ({
+    id: doc.id,
+    ...doc.data()
+  }));
+};
+
+/**
+ * Processa um saque: Marca como pago e atualiza o saldo do vendedor.
+ * @param {string} payoutId - ID do pedido de saque
+ * @param {string} salespersonId - ID do vendedor
+ * @param {number} amount - Valor que foi pago
+ */
+export const adminApprovePayout = async (payoutId, salespersonId, amount) => {
+  const payoutRef = doc(db, PAYOUTS_COLLECTION, payoutId);
+  const salesRef = doc(db, SALESPEOPLE_COLLECTION, salespersonId);
+
+  // 1. Marca o pedido como pago
+  await updateDoc(payoutRef, {
+    status: 'paid',
+    paidAt: new Date().toISOString()
+  });
+
+  // 2. O saldo já foi deduzido no momento da solicitação (para evitar gasto duplo),
+  // mas aqui você poderia registrar logs adicionais se necessário.
+  console.log(`[Payout] Approved: ${amount} for ${salespersonId}`);
+};
+
+// ==========================================
+// BUSINESS INTELLIGENCE (ASSINATURAS)
+// ==========================================
+
+export const getAllSubscriptions = async () => {
+  const q = query(collection(db, SUBSCRIPTIONS_COLLECTION), orderBy("createdAt", "desc"));
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map(doc => ({
+    id: doc.id,
+    ...doc.data()
+  }));
+};
+```
+
+
+--- ARQUIVO: src/contexts/AuthContext.jsx ---
+```javascript
+import React, { createContext, useState, useEffect, useContext } from 'react';
+import { onAuthStateChanged } from 'firebase/auth';
+import { auth } from '../services/firebase';
+
+const AuthContext = createContext({});
+
+export function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    // O Firebase avisa aqui quando termina de verificar o usuário
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setLoading(false); // Só agora paramos de carregar
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Enquanto estiver verificando o login, mostramos uma tela de carregamento
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-barber-dark flex flex-col items-center justify-center gap-4">
+        <div className="w-12 h-12 border-4 border-barber-red border-t-transparent rounded-full animate-spin"></div>
+        <p className="text-barber-gray text-sm animate-pulse">Conectando ao sistema...</p>
+      </div>
+    );
+  }
+
+  return (
+    <AuthContext.Provider value={{ user }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+// Hook para facilitar o uso (opcional, mas boa prática)
+export const useAuth = () => useContext(AuthContext);
+```
+
+
+--- ARQUIVO: src/utils/timeGrid.js ---
+```javascript
+import { setHours, startOfDay } from 'date-fns';
+
+// Configurações do Calendário
+export const START_HOUR = 0; 
+export const END_HOUR = 23;  
+
+// Mudança de estratégia: Em vez de um número fixo, definimos quantas horas queremos ver.
+// Se quisermos ver 10 horas, calculamos a altura dinamicamente no componente.
+// Por padrão, manteremos 90 para telas grandes, mas o DayView agora vai ajustar isso.
+export const PIXELS_PER_HOUR = 90; 
+
+/**
+ * Calcula a posição (TOP) de um horário específico no grid.
+ * @param {string | Date} dateString - Data no formato ISO ou objeto Date
+ * @param {number} customPixelsPerHour - (Opcional) Valor customizado de pixels por hora
+ */
+export const getPositionFromTime = (dateString, customPixelsPerHour = PIXELS_PER_HOUR) => {
+  const date = new Date(dateString);
+  const startOfDayDate = setHours(startOfDay(date), START_HOUR);
+  
+  // Diferença em milissegundos convertida para horas decimais (ex: 10:30 = 10.5)
+  const diffInHours = (date - startOfDayDate) / (1000 * 60 * 60);
+  
+  return diffInHours * customPixelsPerHour;
+};
+
+/**
+ * Calcula a posição da "Linha de Agora" (Time Indicator)
+ */
+export const getNowPosition = (timezone, customPixelsPerHour = PIXELS_PER_HOUR) => {
+  const now = new Date();
+  // Obtém a hora local no fuso horário do profissional
+  const localTimeString = now.toLocaleString("en-US", { timeZone: timezone });
+  const localDate = new Date(localTimeString);
+  
+  return getPositionFromTime(localDate, customPixelsPerHour);
+};
+
+/**
+ * Calcula a altura do card baseada na duração do serviço
+ */
+export const getHeightFromDuration = (durationInMinutes, customPixelsPerHour = PIXELS_PER_HOUR) => {
+  return (durationInMinutes / 60) * customPixelsPerHour;
+};
+
+/**
+ * Gera a lista de horas (00:00 a 23:00)
+ */
+export const hoursArray = Array.from(
+  { length: END_HOUR - START_HOUR + 1 },
+  (_, i) => START_HOUR + i
+);
+
+/**
+ * Converte o movimento de pixels de volta para um horário ISO.
+ * Usado para o Drag & Drop.
+ */
+export const getNewStartTime = (originalStartTime, pixelsMoved, customPixelsPerHour = PIXELS_PER_HOUR) => {
+  const originalDate = new Date(originalStartTime);
+  
+  // Converte pixels movidos em minutos
+  const minutesMoved = (pixelsMoved / customPixelsPerHour) * 60;
+  
+  // Adiciona os minutos à data original
+  const newDate = new Date(originalDate.getTime() + minutesMoved * 60000);
+  
+  // Imã de 15 minutos (Snap)
+  const minutes = newDate.getMinutes();
+  const roundedMinutes = Math.round(minutes / 15) * 15;
+  newDate.setMinutes(roundedMinutes);
+  newDate.setSeconds(0);
+  newDate.setMilliseconds(0);
+  
+  // Retorna ISO formatado corretamente (sem problemas de fuso)
+  return newDate.toISOString();
+};
+
+/**
+ * Formata a exibição de hora para o usuário
+ */
+export const formatTimeDisplay = (isoString) => {
+  if (!isoString) return "--:--";
+  const date = new Date(isoString);
+  return date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+};
+```
+
+
+--- ARQUIVO: src/App.jsx ---
+```javascript
+import React from 'react';
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { Landing } from './pages/Landing'; 
+import { Login } from './pages/Login';
+import { Register } from './pages/Register';
+import { Dashboard } from './pages/Dashboard';
+import { Services } from './pages/Services';
+import { Profile } from './pages/Profile';
+import { Pricing } from './pages/Pricing';
+import { Terms } from './pages/Terms';
+import { Admin } from './pages/Admin';
+import { SetupPro } from './pages/SetupPro';
+import { AdminDashboard } from './pages/AdminDashboard'; 
+import { Billing } from './pages/Billing'; 
+import { SalesDashboard } from './pages/SalesDashboard'; 
+import { JoinSales } from './pages/JoinSales'; 
+import { Support } from './pages/Support'; // Importação da nova Central de Ajuda
+
+// COMPONENTES GLOBAIS
+import { CookieConsent } from './components/ui/CookieConsent';
+import { PWAInstallPrompt } from './components/ui/PWAInstallPrompt';
+
+// NOVAS PÁGINAS
+import { Customers } from './pages/Customers';
+import { Messages } from './pages/Messages';
+
+function App() {
+  return (
+    <BrowserRouter>
+      {/* AVISO DE COOKIES (Global) */}
+      <CookieConsent />
+
+      {/* PROMPT DE INSTALAÇÃO PWA (Global) */}
+      <PWAInstallPrompt />
+
+      <Routes>
+        {/* ROTAS PÚBLICAS (Conversão e Ajuda) */}
+        <Route path="/" element={<Landing />} />
+        <Route path="/join-sales" element={<JoinSales />} />
+        <Route path="/support" element={<Support />} /> {/* Nova Rota de Suporte */}
+        
+        {/* ROTAS DE ACESSO */}
+        <Route path="/login" element={<Login />} />
+        <Route path="/register" element={<Register />} />
+        
+        {/* DASHBOARD PRINCIPAL (BARBEIRO) */}
+        <Route path="/dashboard" element={<Dashboard />} />
+        
+        {/* ROTAS DE GESTÃO E CRM */}
+        <Route path="/customers" element={<Customers />} />
+        <Route path="/messages" element={<Messages />} />
+        <Route path="/services" element={<Services />} />
+        
+        {/* CONFIGURAÇÕES E PERFIL */}
+        <Route path="/profile" element={<Profile />} />
+        <Route path="/pricing" element={<Pricing />} />
+        <Route path="/setup-pro" element={<SetupPro />} />
+        <Route path="/billing" element={<Billing />} /> 
+        
+        {/* DEPARTAMENTO COMERCIAL (VENDEDOR) */}
+        <Route path="/sales-console" element={<SalesDashboard />} /> 
+        
+        {/* INSTITUCIONAL E ADMIN */}
+        <Route path="/terms" element={<Terms />} />
+        <Route path="/admin" element={<Admin />} /> 
+        <Route path="/admin-dashboard" element={<AdminDashboard />} /> 
+      </Routes>
+    </BrowserRouter>
+  );
+}
+
+export default App;
+```
+
+
+--- ARQUIVO: src/main.jsx ---
+```javascript
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App.jsx';
+import './index.css';
+import { AuthProvider } from './contexts/AuthContext';
+
+// Importação necessária para o PWA (Vite Plugin PWA)
+import { registerSW } from 'virtual:pwa-register';
+
+// Registra o Service Worker para habilitar instalação e cache
+// immediate: true faz com que o app se atualize assim que houver uma nova versão
+registerSW({ immediate: true });
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    {/* Envolvemos o App inteiro com o AuthProvider */}
+    <AuthProvider>
+      <App />
+    </AuthProvider>
+  </React.StrictMode>,
+);
+```
+
+
+--- ARQUIVO: src/index.css ---
+```javascript
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background-color: #0F0F0F;
+  color: #F5F5F5;
+  font-family: sans-serif;
+}
+/* Adicione no final do seu src/index.css */
+@keyframes pulse-gold {
+  0%, 100% {
+    box-shadow: 0 0 5px rgba(197, 160, 89, 0.2);
+    border-color: rgba(197, 160, 89, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 20px rgba(197, 160, 89, 0.6);
+    border-color: rgba(197, 160, 89, 1);
+  }
+}
+
+.animate-pulse-gold {
+  animation: pulse-gold 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+```
+
+
+--- ARQUIVO: tailwind.config.js ---
+```javascript
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
+  ],
+  theme: {
+    extend: {
+      colors: {
+        barber: {
+          black: '#1A1A1A',
+          dark: '#0F0F0F',
+          red: '#D92525',
+          blue: '#1E40AF',
+          white: '#F5F5F5',
+          gray: '#808080',
+          gold: '#C5A059',
+        }
+      }
+    },
+  },
+  plugins: [],
+}
+```
+
+
+--- ARQUIVO: src/pages/Login.jsx ---
+```javascript
+import React, { useState } from 'react';
+import { signInWithEmailAndPassword, sendPasswordResetEmail } from 'firebase/auth'; // Adicionado reset de senha
+import { auth } from '../services/firebase';
+import { Button } from '../components/ui/Button';
+import { Input } from '../components/ui/Input';
+import { Scissors, KeyRound } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { getProfessionalProfile } from '../services/professionalService';
+import { getSalespersonProfile } from '../services/salesService';
+
+export function Login() {
+  const navigate = useNavigate();
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [resetLoading, setResetLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [message, setMessage] = useState('');
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    setMessage('');
+
+    try {
+      // 1. Realiza o login
+      const userCredential = await signInWithEmailAndPassword(auth, email, password);
+      const user = userCredential.user;
+
+      // 2. REDIRECIONAMENTO INTELIGENTE
+      // Verifica primeiro se é um Barbeiro
+      const barberProfile = await getProfessionalProfile();
+      if (barberProfile) {
+        navigate('/dashboard');
+        return;
+      }
+
+      // Se não for barbeiro, verifica se é um Vendedor
+      const salesProfile = await getSalespersonProfile(user.uid);
+      if (salesProfile) {
+        navigate('/sales-console');
+        return;
+      }
+
+      // Se for um Admin (que geralmente está na coleção barbers), o primeiro check já resolve.
+      // Caso contrário, manda para o dashboard por padrão
+      navigate('/dashboard'); 
+
+    } catch (err) {
+      console.error(err);
+      setError("Login failed. Please check your email and password.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Função para recuperar senha
+  const handleForgotPassword = async () => {
+    if (!email) {
+      setError("Please enter your email address first.");
+      return;
+    }
+    
+    setResetLoading(true);
+    setError('');
+    try {
+      await sendPasswordResetEmail(auth, email);
+      setMessage("Password reset email sent! Check your inbox.");
+    } catch (err) {
+      setError("Error sending reset email. Verify if the email is correct.");
+    } finally {
+      setResetLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-barber-dark flex items-center justify-center p-4">
+      <div className="w-full max-w-md bg-barber-black p-8 rounded-2xl border border-zinc-800 shadow-2xl">
+        
+        <div className="flex flex-col items-center gap-2 mb-8">
+          <div className="w-16 h-16 bg-barber-gold rounded-full flex items-center justify-center text-barber-black shadow-lg shadow-barber-gold/20">
+            <Scissors size={32} />
+          </div>
+          <h1 className="text-2xl font-black text-barber-white uppercase italic tracking-tighter">Schedy Login</h1>
+          <p className="text-barber-gray text-sm font-medium">Access your AI-powered dashboard</p>
+        </div>
+
+        <form onSubmit={handleLogin} className="flex flex-col gap-4">
+          <Input 
+            label="E-mail" 
+            type="email"
+            placeholder="your@email.com" 
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            required
+          />
+          
+          <div className="space-y-1">
+            <Input 
+              label="Password" 
+              type="password" 
+              placeholder="******" 
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+            />
+            <div className="flex justify-end">
+                <button 
+                    type="button" 
+                    onClick={handleForgotPassword}
+                    disabled={resetLoading}
+                    className="text-[10px] font-black text-barber-gold uppercase tracking-widest hover:text-white transition-colors flex items-center gap-1"
+                >
+                    {resetLoading ? "Sending..." : "Forgot Password?"}
+                </button>
+            </div>
+          </div>
+
+          {error && (
+            <div className="text-red-500 text-xs text-center bg-red-500/10 p-3 rounded border border-red-500/20 font-bold">
+                {error}
+            </div>
+          )}
+
+          {message && (
+            <div className="text-green-500 text-xs text-center bg-green-500/10 p-3 rounded border border-green-500/20 font-bold">
+                {message}
+            </div>
+          )}
+
+          <Button type="submit" loading={loading} className="h-14 font-black uppercase italic tracking-tighter">
+            Sign In
+          </Button>
+        </form>
+
+        <div className="mt-8 text-center space-y-4 border-t border-zinc-800 pt-6">
+          <p className="text-xs text-barber-gray font-bold uppercase tracking-widest">
+            New to Schedy AI?
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <Button variant="outline" onClick={() => navigate('/register')} className="h-10 text-[10px] font-black uppercase">
+                Professional
+            </Button>
+            <Button variant="outline" onClick={() => navigate('/join-sales')} className="h-10 text-[10px] font-black uppercase border-zinc-700 text-zinc-500">
+                Partner
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+
+--- ARQUIVO: src/pages/Register.jsx ---
+```javascript
+import React, { useState, useEffect } from 'react';
+import { createUserWithEmailAndPassword } from 'firebase/auth';
+import { doc, setDoc, getDocs, collection, query, where, deleteDoc } from 'firebase/firestore';
+import { auth, db } from '../services/firebase';
+import { Button } from '../components/ui/Button';
+import { Input } from '../components/ui/Input';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { UserPlus, Globe, Tag, Briefcase, X } from 'lucide-react'; // Adicionado ícone X
+
+const SUPPORTED_COUNTRIES = {
+  US: { name: 'United States', ddi: '1', currency: '$', timezone: 'America/New_York', flag: '🇺🇸' },
+  BR: { name: 'Brasil', ddi: '55', currency: 'R$', timezone: 'America/Sao_Paulo', flag: '🇧🇷' },
+  PT: { name: 'Portugal', ddi: '351', currency: '€', timezone: 'Europe/Lisbon', flag: '🇵🇹' },
+  ES: { name: 'España', ddi: '34', currency: '€', timezone: 'Europe/Madrid', flag: '🇪🇸' },
+  FR: { name: 'France', ddi: '33', currency: '€', timezone: 'Europe/Paris', flag: '🇫🇷' },
+  IT: { name: 'Italia', ddi: '39', currency: '€', timezone: 'Europe/Rome', flag: '🇮🇹' },
+  GB: { name: 'United Kingdom', ddi: '44', currency: '£', timezone: 'Europe/London', flag: '🇬🇧' },
+};
+
+export function Register() {
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [country, setCountry] = useState('US');
+  const [referralCode, setReferralCode] = useState(''); 
+  const [acceptedTerms, setAcceptedTerms] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const isSalesMode = searchParams.get('role') === 'sales';
+
+  useEffect(() => {
+    const ref = searchParams.get('ref');
+    if (ref) {
+      setReferralCode(ref.toUpperCase());
+    }
+  }, [searchParams]);
+
+  const generateReferralCode = (userName) => {
+    const prefix = userName.substring(0, 3).toUpperCase().replace(/[^A-Z]/g, 'SAL');
+    const random = Math.floor(100 + Math.random() * 900);
+    return `${prefix}${random}`;
+  };
+
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    
+    if (!acceptedTerms) {
+      setError("You must accept the Terms of Service to continue.");
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+
+    try {
+      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+      const user = userCredential.user;
+      const selectedCountryData = SUPPORTED_COUNTRIES[country];
+
+      if (isSalesMode) {
+        const salesQuery = query(collection(db, "salespeople"), where("email", "==", email));
+        const querySnapshot = await getDocs(salesQuery);
+        
+        let finalSalesData = {
+          name: name,
+          email: email,
+          country: country,
+          ddi: selectedCountryData.ddi,
+          referralCode: generateReferralCode(name),
+          role: "sales",
+          commissionRate: 0.20,
+          totalEarnings: 0,
+          currentBalance: 0,
+          activeClients: 0,
+          status: 'active',
+          createdAt: new Date().toISOString(),
+        };
+
+        if (!querySnapshot.empty) {
+          const existingDoc = querySnapshot.docs[0];
+          const existingData = existingDoc.data();
+          finalSalesData = { ...finalSalesData, ...existingData };
+          await deleteDoc(doc(db, "salespeople", existingDoc.id));
+        }
+
+        await setDoc(doc(db, "salespeople", user.uid), finalSalesData);
+        navigate('/sales-console');
+
+      } else {
+        await setDoc(doc(db, "barbers", user.uid), {
+          name: name,
+          barberShopName: name, 
+          email: email,
+          plan: "free",
+          role: "professional",
+          country: country,
+          currency: selectedCountryData.currency,
+          timezone: selectedCountryData.timezone,
+          ddi: selectedCountryData.ddi,
+          referredBy: referralCode.trim().toUpperCase() || null,
+          createdAt: new Date().toISOString(),
+          acceptedTermsAt: new Date().toISOString(), 
+        });
+        navigate('/dashboard');
+      }
+
+    } catch (err) {
+      console.error("Registration Error:", err);
+      if (err.code === 'auth/email-already-in-use') {
+        setError("This email is already in use. Try logging in.");
+      } else {
+        setError("Error creating account. Please try again.");
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-barber-dark flex items-center justify-center p-4 animate-in fade-in duration-500">
+      {/* CARD PRINCIPAL COM POSIÇÃO RELATIVA PARA O BOTÃO DE FECHAR */}
+      <div className="w-full max-w-md bg-barber-black p-8 rounded-3xl border border-zinc-800 shadow-2xl relative">
+        
+        {/* BOTÃO DE FECHAR (X) */}
+        <button 
+          onClick={() => navigate('/login')}
+          className="absolute top-6 right-6 text-zinc-500 hover:text-white transition-colors p-2 hover:bg-zinc-900 rounded-xl"
+          title="Back to Login"
+        >
+          <X size={20} />
+        </button>
+
+        <div className="flex flex-col items-center gap-2 mb-8">
+          <div className={`w-16 h-16 rounded-full flex items-center justify-center border ${
+            isSalesMode ? 'bg-barber-gold/10 text-barber-gold border-barber-gold/20' : 'bg-barber-red/10 text-barber-red border-barber-red/20'
+          }`}>
+            {isSalesMode ? <Briefcase size={32} /> : <UserPlus size={32} />}
+          </div>
+          <h1 className="text-2xl font-black text-barber-white uppercase italic tracking-tighter">
+            {isSalesMode ? 'Partner Activation' : 'Get Started'}
+          </h1>
+          <p className="text-barber-gray text-sm text-center font-medium">
+            {isSalesMode ? 'Set your password to access your sales console.' : 'Join Schedy AI and never miss another appointment.'}
+          </p>
+        </div>
+
+        <form onSubmit={handleRegister} className="flex flex-col gap-4">
+          
+          <div className="flex flex-col gap-1">
+            <label className="text-sm text-barber-gray font-medium flex items-center gap-2">
+              <Globe size={14} className="text-barber-gold" /> Select Your Country
+            </label>
+            <select 
+              value={country}
+              onChange={(e) => setCountry(e.target.value)}
+              className="bg-barber-black border border-zinc-800 rounded-xl p-3 text-barber-white focus:border-barber-gold outline-none transition-colors appearance-none cursor-pointer"
+            >
+              {Object.keys(SUPPORTED_COUNTRIES).map((key) => (
+                <option key={key} value={key} className="bg-barber-black text-white">
+                  {SUPPORTED_COUNTRIES[key].flag} {SUPPORTED_COUNTRIES[key].name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <Input 
+            label={isSalesMode ? "Full Name" : "Business or Personal Name"} 
+            placeholder={isSalesMode ? "Confirm your name" : "Ex: John's Barbershop"} 
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            required
+          />
+
+          <Input 
+            label="E-mail" 
+            type="email"
+            placeholder="Use your best email" 
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            required
+          />
+          
+          <Input 
+            label="Create Password" 
+            type="password" 
+            placeholder="Minimum 6 characters" 
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+          />
+
+          {!isSalesMode && (
+            <div className="relative">
+              <Input 
+                label="Referral Code (Optional)" 
+                placeholder="Ex: JOAO20" 
+                value={referralCode}
+                onChange={(e) => setReferralCode(e.target.value)}
+              />
+              <Tag size={16} className="absolute right-3 top-10 text-zinc-700" />
+            </div>
+          )}
+
+          <div className="flex items-start gap-3 mt-2 px-1">
+            <input 
+              type="checkbox" 
+              id="terms"
+              checked={acceptedTerms}
+              onChange={(e) => setAcceptedTerms(e.target.checked)}
+              className="mt-1 w-4 h-4 rounded border-zinc-800 bg-zinc-900 text-barber-gold focus:ring-barber-gold transition-all cursor-pointer"
+            />
+            <label htmlFor="terms" className="text-xs text-barber-gray leading-tight cursor-pointer select-none">
+              I accept the <Link to="/terms" className="text-barber-gold hover:underline font-medium">Terms of Service</Link>
+              {isSalesMode ? ' and the Partner Commission Agreement.' : ' and recognize that my AI Concierge will operate via a US (+1) number.'}
+            </label>
+          </div>
+
+          {error && (
+            <div className="text-red-500 text-xs text-center bg-red-500/10 p-3 rounded border border-red-500/20 font-bold">
+              {error}
+            </div>
+          )}
+
+          <Button type="submit" loading={loading} variant="primary" className="mt-2 h-14 uppercase font-black tracking-widest italic">
+            {isSalesMode ? 'Activate Partner Account' : 'Create Free Account'}
+          </Button>
+        </form>
+
+        <div className="mt-6 text-center">
+          <p className="text-sm text-barber-gray font-medium">
+            Already have an account? <Link to="/login" className="text-barber-gold hover:underline font-bold">Log In</Link>
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+
+--- ARQUIVO: src/pages/Dashboard.jsx ---
+```javascript
+import React, { useState, useEffect } from 'react';
+import { AppLayout } from '../components/ui/AppLayout';
+import { DayView } from '../components/calendar/DayView';
+import { DashboardHeader } from '../components/dashboard/DashboardHeader';
+import { AppointmentModal } from '../components/dashboard/AppointmentModal';
+import { BlockModal } from '../components/dashboard/BlockModal';
+import { format, addDays, subDays, isSameDay, isBefore } from 'date-fns';
+import { 
+  getServices, 
+  addAppointment, 
+  getAppointments, 
+  updateAppointmentTime,
+  updateAppointmentFull,
+  deleteAppointment,
+  getProfessionalProfile,
+  addBlockedTime 
+} from '../services/professionalService'; 
+
+export function Dashboard() {
+  // --- DATA STATES ---
+  const [timezone, setTimezone] = useState('America/New_York');
+  const [selectedDate, setSelectedDate] = useState(new Date());
+  const [appointments, setAppointments] = useState([]);
+  const [services, setServices] = useState([]);
+  const [currency, setCurrency] = useState('$'); 
+  const [businessHours, setBusinessHours] = useState({ open: "08:00", close: "18:00", break: "12:00-13:00" });
+
+  // --- UI STATES ---
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isBlockModalOpen, setIsBlockModalOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [editingAppointment, setEditingAppointment] = useState(null);
+  const [modalInitialDate, setModalInitialDate] = useState(new Date());
+
+  // --- HELPERS ---
+  const getNowInTimezone = (tz) => {
+    const now = new Date();
+    const localTime = now.toLocaleString("en-US", { timeZone: tz });
+    return new Date(localTime);
+  };
+
+  const checkConflict = (startISO, duration, excludeId = null) => {
+    const newBegin = new Date(startISO).getTime();
+    const newEnd = newBegin + (parseInt(duration) * 60000);
+    return appointments.some(apt => {
+      if (apt.id === excludeId) return false; 
+      const exBegin = new Date(apt.startTime).getTime();
+      const exEnd = exBegin + (parseInt(apt.duration) * 60000);
+      return (newBegin < exEnd && newEnd > exBegin);
+    });
+  };
+
+  // --- DATA LOADING ---
+  useEffect(() => {
+    loadStaticData();
+    const interval = setInterval(refreshAppointments, 10000); 
+    return () => clearInterval(interval);
+  }, [timezone]); 
+
+  const loadStaticData = async () => {
+    try {
+      const profile = await getProfessionalProfile();
+      if (profile) {
+        setCurrency(profile.currency || '$');
+        if (profile.timezone) {
+            setTimezone(profile.timezone);
+            setSelectedDate(getNowInTimezone(profile.timezone));
+        }
+        if (profile.settings?.businessHours) {
+          setBusinessHours(prev => ({ ...prev, ...profile.settings.businessHours }));
+        }
+      }
+      const servicesData = await getServices();
+      setServices(servicesData);
+      await refreshAppointments();
+    } catch (error) { console.error("Load failed", error); }
+  };
+
+  const refreshAppointments = async () => {
+    try {
+      const data = await getAppointments();
+      setAppointments(data);
+    } catch (error) { console.error("Sync failed", error); }
+  };
+
+  // --- HANDLERS ---
+  const handleSaveAppointment = async (formData) => {
+    const { clientName, selectedServiceIds, time, notes, formDate } = formData;
+    const selectedData = services.filter(s => selectedServiceIds.includes(s.id));
+    if (selectedData.length === 0) return alert("Select a service.");
+    
+    const totalDuration = selectedData.reduce((acc, s) => acc + s.duration, 0);
+    const totalPrice = selectedData.reduce((acc, s) => acc + s.price, 0);
+    const combinedServiceName = selectedData.map(s => s.name).join(' + ');
+    const fullStartDateStr = `${format(formDate, 'yyyy-MM-dd')}T${time}:00`;
+
+    if (isBefore(new Date(fullStartDateStr), getNowInTimezone(timezone))) return alert("Past dates forbidden.");
+    if (checkConflict(fullStartDateStr, totalDuration, editingAppointment?.id)) return alert("Conflict detected.");
+
+    setLoading(true);
+    try {
+      const aptData = {
+        clientName, serviceName: combinedServiceName, price: totalPrice,
+        duration: totalDuration, startTime: fullStartDateStr, notes,
+        status: editingAppointment ? editingAppointment.status : 'scheduled'
+      };
+      if (editingAppointment) await updateAppointmentFull(editingAppointment.id, aptData);
+      else await addAppointment(aptData);
+      await refreshAppointments();
+      setIsModalOpen(false);
+    } catch (error) { alert("Save error"); } 
+    finally { setLoading(false); }
+  };
+
+  const handleSaveBlock = async (formData) => {
+    const { blockTime, blockDuration, blockRecurrence, blockOccurrences, blockNotes, formDate } = formData;
+    const fullStartDateStr = `${format(formDate, 'yyyy-MM-dd')}T${blockTime}:00`;
+    
+    if (checkConflict(fullStartDateStr, blockDuration)) return alert("Conflict detected.");
+
+    setLoading(true);
+    try {
+      await addBlockedTime({
+        startTime: fullStartDateStr, duration: blockDuration, notes: blockNotes,
+        recurrence: blockRecurrence, occurrences: blockOccurrences
+      });
+      await refreshAppointments();
+      setIsBlockModalOpen(false);
+    } catch (error) { alert("Block error"); }
+    finally { setLoading(false); }
+  };
+
+  const handleQuickDelete = async (id) => {
+    if (!confirm("Are you sure?")) return;
+    try {
+      await deleteAppointment(id);
+      refreshAppointments();
+    } catch (error) { alert("Delete error"); }
+  };
+
+  const handleToggleComplete = async (id) => {
+    const apt = appointments.find(a => a.id === id);
+    if (!apt || apt.type === 'block') return;
+    try {
+      await updateAppointmentFull(id, { ...apt, status: apt.status === 'completed' ? 'scheduled' : 'completed' });
+      refreshAppointments();
+    } catch (error) { alert("Status error"); }
+  };
+
+  return (
+    <AppLayout>
+      <DashboardHeader 
+        timezone={timezone}
+        selectedDate={selectedDate}
+        onPrevDay={() => setSelectedDate(prev => subDays(prev, 1))}
+        onNextDay={() => setSelectedDate(prev => addDays(prev, 1))}
+        onToday={() => setSelectedDate(getNowInTimezone(timezone))}
+        onOpenBlock={() => { setModalInitialDate(selectedDate); setIsBlockModalOpen(true); }}
+        onOpenBooking={() => { setEditingAppointment(null); setModalInitialDate(selectedDate); setIsModalOpen(true); }}
+      />
+
+      <div className="h-[calc(100vh-240px)] sm:h-[calc(100vh-210px)] min-h-[400px]">
+        <DayView 
+          appointments={appointments.filter(apt => isSameDay(new Date(apt.startTime), selectedDate) || isSameDay(new Date(apt.startTime), addDays(selectedDate, 1)))} 
+          onAppointmentMove={async (id, newStart) => {
+             // Lógica de move simplificada aqui ou mantida no DayView
+             await updateAppointmentTime(id, newStart);
+             refreshAppointments();
+          }}
+          onAppointmentClick={(apt) => {
+            if (apt.type === 'block') return handleQuickDelete(apt.id);
+            setEditingAppointment(apt);
+            setIsModalOpen(true);
+          }}
+          onTimeSlotClick={(date) => {
+            setEditingAppointment(null);
+            setModalInitialDate(date);
+            setIsModalOpen(true);
+          }} 
+          onComplete={handleToggleComplete}
+          onDelete={handleQuickDelete}
+          startDate={selectedDate} 
+          businessHours={businessHours}
+          timezone={timezone} 
+        />
+      </div>
+
+      <AppointmentModal 
+        isOpen={isModalOpen}
+        onClose={() => setIsModalOpen(false)}
+        editingAppointment={editingAppointment}
+        services={services}
+        currency={currency}
+        onSave={handleSaveAppointment}
+        onDelete={handleQuickDelete}
+        initialDate={modalInitialDate}
+        loading={loading}
+      />
+
+      <BlockModal 
+        isOpen={isBlockModalOpen}
+        onClose={() => setIsBlockModalOpen(false)}
+        onSave={handleSaveBlock}
+        initialDate={modalInitialDate}
+        loading={loading}
+      />
+    </AppLayout>
+  );
+}
+```
+
+
+--- ARQUIVO: src/pages/Services.jsx ---
+```javascript
+import React, { useState, useEffect } from 'react';
+import { AppLayout } from '../components/ui/AppLayout';
+import { Button } from '../components/ui/Button';
+import { Input } from '../components/ui/Input';
+import { Modal } from '../components/ui/Modal';
+import { Plus, Trash2, Clock, DollarSign, Pencil } from 'lucide-react'; 
+import { 
+    addService, 
+    getServices, 
+    deleteService, 
+    updateService, 
+    getProfessionalProfile 
+} from '../services/professionalService'; 
+
+export function Services() {
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [services, setServices] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [currency, setCurrency] = useState('$'); // Moeda padrão
+  
+  // Estados do Formulário
+  const [editingService, setEditingService] = useState(null); 
+  const [name, setName] = useState('');
+  const [price, setPrice] = useState('');
+  const [duration, setDuration] = useState('30');
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    loadServices();
+  }, []);
+
+  const loadServices = async () => {
+    try {
+      // 1. BUSCA O PERFIL PARA DEFINIR A MOEDA DINÂMICA
+      const profile = await getProfessionalProfile();
+      if (profile) {
+        // Se o perfil já tiver a moeda salva (como configuramos no Registro/Profile), usamos ela.
+        // Caso contrário, mantemos o fallback baseado no país para contas antigas.
+        if (profile.currency) {
+          setCurrency(profile.currency);
+        } else {
+          let fallbackCurrency = '$'; 
+          if (profile.country === 'BR') fallbackCurrency = 'R$';
+          if (profile.country === 'PT') fallbackCurrency = '€';
+          setCurrency(fallbackCurrency);
+        }
+      }
+
+      // 2. BUSCA A LISTA DE SERVIÇOS
+      const data = await getServices();
+      setServices(data);
+    } catch (error) {
+      console.error("Error loading services:", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Abre o modal para CRIAR (Preservado)
+  const handleNewService = () => {
+    setEditingService(null);
+    setName('');
+    setPrice('');
+    setDuration('30');
+    setIsModalOpen(true);
+  };
+
+  // Abre o modal para EDITAR (Preservado)
+  const handleEditService = (service) => {
+    setEditingService(service);
+    setName(service.name);
+    setPrice(service.price.toString());
+    setDuration(service.duration.toString());
+    setIsModalOpen(true);
+  };
+
+  const handleSave = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      const serviceData = {
+        name,
+        price: parseFloat(price),
+        duration: parseInt(duration)
+      };
+
+      if (editingService) {
+        await updateService(editingService.id, serviceData);
+      } else {
+        await addService(serviceData);
+      }
+      
+      setIsModalOpen(false);
+      loadServices(); 
+    } catch (error) {
+      alert("Error saving service");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async (id) => {
+    if (confirm("Are you sure you want to delete this service?")) {
+      await deleteService(id);
+      loadServices();
+    }
+  };
+
+  return (
+    <AppLayout>
+      <header className="flex items-center justify-between mb-8">
+        <div>
+          <h1 className="text-2xl font-bold text-barber-white">My Services</h1>
+          <p className="text-barber-gray text-sm">Manage your catalog and pricing</p>
+        </div>
+        <Button className="w-auto gap-2" onClick={handleNewService}>
+          <Plus size={20} /> New Service
+        </Button>
+      </header>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {loading ? (
+          <p className="text-barber-gray animate-pulse">Loading services...</p>
+        ) : services.length === 0 ? (
+          <div className="col-span-3 text-center py-10 text-barber-gray border border-dashed border-zinc-800 rounded-xl">
+            No services registered yet.
+          </div>
+        ) : (
+          services.map((service) => (
+            <div key={service.id} className="bg-barber-black border border-zinc-800 p-5 rounded-2xl flex justify-between items-center group hover:border-barber-gold transition-all shadow-lg">
+              <div>
+                <h3 className="font-bold text-barber-white text-lg">{service.name}</h3>
+                <div className="flex gap-4 mt-2 text-sm text-barber-gray">
+                  {/* EXIBIÇÃO DA MOEDA DINÂMICA */}
+                  <span className="flex items-center gap-1 font-medium text-barber-gold">
+                    <DollarSign size={14}/> {currency}{service.price}
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <Clock size={14}/> {service.duration} min
+                  </span>
+                </div>
+              </div>
+              <div className="flex gap-1">
+                <button 
+                  onClick={() => handleEditService(service)}
+                  className="text-zinc-500 hover:text-barber-gold transition-colors p-2 rounded-lg hover:bg-barber-gold/10"
+                >
+                  <Pencil size={18} />
+                </button>
+                <button 
+                  onClick={() => handleDelete(service.id)}
+                  className="text-zinc-500 hover:text-red-500 transition-colors p-2 rounded-lg hover:bg-red-500/10"
+                >
+                  <Trash2 size={18} />
+                </button>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+
+      <Modal 
+        isOpen={isModalOpen} 
+        onClose={() => setIsModalOpen(false)}
+        title={editingService ? "Edit Service" : "New Service"}
+      >
+        <form onSubmit={handleSave} className="flex flex-col gap-4">
+          <Input 
+            label="Service Name" 
+            placeholder="Ex: Haircut" 
+            value={name}
+            onChange={e => setName(e.target.value)}
+            required
+          />
+          
+          <div className="flex gap-4">
+            {/* LABEL DA MOEDA DINÂMICA NO INPUT */}
+            <Input 
+              label={`Price (${currency})`} 
+              type="number" 
+              step="0.01" 
+              placeholder="30.00" 
+              value={price}
+              onChange={e => setPrice(e.target.value)}
+              required
+            />
+            <div className="w-full">
+              <label className="text-sm text-barber-gray font-medium mb-1 block">Duration</label>
+              <select 
+                className="w-full bg-barber-black border border-zinc-800 rounded-lg p-3 text-barber-white focus:border-barber-gold outline-none transition-all"
+                value={duration}
+                onChange={e => setDuration(e.target.value)}
+              >
+                <option value="15">15 min</option>
+                <option value="30">30 min</option>
+                <option value="45">45 min</option>
+                <option value="60">1 hour</option>
+                <option value="90">1h 30min</option>
+                <option value="120">2 hours</option>
+              </select>
+            </div>
+          </div>
+
+          <Button type="submit" loading={saving} className="mt-4 h-14 font-bold uppercase tracking-widest">
+            {editingService ? "Update Service" : "Create Service"}
+          </Button>
+        </form>
+      </Modal>
+    </AppLayout>
+  );
+}
+```
+
+
+--- ARQUIVO: src/pages/Profile.jsx ---
+```javascript
+import React, { useState, useEffect } from 'react';
+import { AppLayout } from '../components/ui/AppLayout';
+import { Button } from '../components/ui/Button';
+import { Input } from '../components/ui/Input';
+import { User, MapPin, Phone, Building, Globe, Clock, Zap, Link as LinkIcon, Info } from 'lucide-react';
+import { getProfessionalProfile, updateProfessionalProfile } from '../services/professionalService'; 
+
+// 1. MAPEAMENTO DE FUSOS HORÁRIOS (Expandido para novos países)
+const TIMEZONE_OPTIONS = {
+  US: [
+    { value: 'America/New_York', label: 'Eastern Time (NY, Miami)' },
+    { value: 'America/Chicago', label: 'Central Time (Chicago, Texas)' },
+    { value: 'America/Denver', label: 'Mountain Time (Denver, Phoenix)' },
+    { value: 'America/Los_Angeles', label: 'Pacific Time (LA, Vegas)' }
+  ],
+  BR: [
+    { value: 'America/Sao_Paulo', label: 'Brasília / SP / RJ / Sul / Nordeste' },
+    { value: 'America/Manaus', label: 'Amazonas (AMT)' },
+    { value: 'America/Cuiaba', label: 'Mato Grosso' },
+    { value: 'America/Fortaleza', label: 'Norte / Nordeste' }
+  ],
+  PT: [
+    { value: 'Europe/Lisbon', label: 'Portugal Continental / Madeira' },
+    { value: 'Atlantic/Azores', label: 'Açores' }
+  ],
+  ES: [{ value: 'Europe/Madrid', label: 'España (Madrid)' }],
+  FR: [{ value: 'Europe/Paris', label: 'France (Paris)' }],
+  IT: [{ value: 'Europe/Rome', label: 'Italia (Roma)' }],
+  GB: [{ value: 'Europe/London', label: 'United Kingdom (London)' }]
+};
+
+// 2. CONFIGURAÇÃO DE PAÍSES (Sincronizado com o Registro)
+const COUNTRY_CONFIG = {
+  US: { name: 'United States', ddi: '1', currency: '$', flag: '🇺🇸' },
+  BR: { name: 'Brazil', ddi: '55', currency: 'R$', flag: '🇧🇷' },
+  PT: { name: 'Portugal', ddi: '351', currency: '€', flag: '🇵🇹' },
+  ES: { name: 'España', ddi: '34', currency: '€', flag: '🇪🇸' },
+  FR: { name: 'France', ddi: '33', currency: '€', flag: '🇫🇷' },
+  IT: { name: 'Italia', ddi: '39', currency: '€', flag: '🇮🇹' },
+  GB: { name: 'United Kingdom', ddi: '44', currency: '£', flag: '🇬🇧' }
+};
+
+export function Profile() {
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  // Estados do Perfil
+  const [country, setCountry] = useState('US');
+  const [timezone, setTimezone] = useState('America/New_York'); 
+  const [barberShopName, setBarberShopName] = useState('');
+  const [whatsapp, setWhatsapp] = useState('');
+  const [address, setAddress] = useState('');
+  const [email, setEmail] = useState(''); 
+  const [slug, setSlug] = useState('');
+  const [openTime, setOpenTime] = useState('08:00');
+  const [closeTime, setCloseTime] = useState('18:00');
+  const [breakTime, setBreakTime] = useState('12:00-13:00');
+  const [aiPreference, setAiPreference] = useState('none');
+
+  useEffect(() => {
+    loadProfile();
+  }, []);
+
+  const loadProfile = async () => {
+    try {
+      const data = await getProfessionalProfile();
+      if (data) {
+        setBarberShopName(data.barberShopName || data.name || '');
+        setWhatsapp(data.phone || '');
+        setAddress(data.address || '');
+        setEmail(data.email || '');
+        setCountry(data.country || 'US');
+        setTimezone(data.timezone || 'America/New_York'); 
+        setSlug(data.slug || '');
+        if (data.settings?.businessHours) {
+          setOpenTime(data.settings.businessHours.open || '08:00');
+          setCloseTime(data.settings.businessHours.close || '18:00');
+          setBreakTime(data.settings.businessHours.break || '12:00-13:00');
+        }
+        setAiPreference(data.settings?.aiPreference || 'none');
+      }
+    } catch (error) {
+      console.error("Error loading profile", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCountryChange = (e) => {
+    const newCountry = e.target.value;
+    setCountry(newCountry);
+    setWhatsapp(''); // Limpa telefone ao mudar país para evitar formato errado
+    // Seleciona o primeiro fuso horário disponível para o novo país
+    if (TIMEZONE_OPTIONS[newCountry]) {
+      setTimezone(TIMEZONE_OPTIONS[newCountry][0].value);
+    }
+  };
+
+  const handlePhoneChange = (e) => {
+    let value = e.target.value.replace(/\D/g, "");
+    
+    // Máscaras de Telefone por País
+    if (country === 'BR') {
+      value = value.slice(0, 11).replace(/^(\d{2})(\d)/g, '($1) $2').replace(/(\d)(\d{4})$/, '$1-$2');
+    } else if (country === 'US') {
+      value = value.slice(0, 10).replace(/^(\d{3})(\d)/g, '($1) $2').replace(/(\d{3})(\d)/, '$1-$2');
+    } else if (country === 'GB') {
+      value = value.slice(0, 11).replace(/(\d{4})(\d{6})/, '$1 $2');
+    } else {
+      // Padrão Europeu Genérico (ES, FR, IT, PT) - Geralmente 9 dígitos em blocos
+      value = value.slice(0, 9).replace(/(\d{3})(\d{3})(\d{3})/, '$1 $2 $3');
+    }
+    setWhatsapp(value);
+  };
+
+  const handleSlugChange = (e) => {
+    const value = e.target.value.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    setSlug(value);
+  };
+
+  const handleSave = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    const config = COUNTRY_CONFIG[country];
+
+    try {
+      await updateProfessionalProfile({
+        barberShopName,
+        phone: whatsapp,
+        address,
+        country,
+        currency: config.currency,
+        timezone: timezone,
+        ddi: config.ddi,
+        slug: slug,
+        settings: {
+          aiPreference,
+          businessHours: { open: openTime, close: closeTime, break: breakTime }
+        }
+      });
+      alert("Profile updated successfully!");
+    } catch (error) {
+      alert("Error saving profile");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const getInitials = (name) => {
+    return name.split(' ').map((n) => n[0]).slice(0, 2).join('').toUpperCase();
+  };
+
+  return (
+    <AppLayout>
+      <header className="mb-8">
+        <h1 className="text-2xl font-bold text-barber-white">Professional Profile</h1>
+        <p className="text-barber-gray">Configure your business rules and AI assistant</p>
+      </header>
+
+      {loading ? (
+        <p className="text-barber-gray">Loading...</p>
+      ) : (
+        <form onSubmit={handleSave} className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          
+          {/* COLUNA ESQUERDA: STATUS E ID */}
+          <div className="lg:col-span-1 space-y-6">
+            <div className="bg-barber-black border border-zinc-800 rounded-xl p-6 flex flex-col items-center text-center shadow-xl">
+              <div className="w-24 h-24 bg-barber-gold rounded-full flex items-center justify-center mb-4 border-4 border-zinc-900 shadow-xl text-3xl font-bold text-barber-black">
+                {getInitials(barberShopName || "AI")}
+              </div>
+              <h2 className="text-lg font-bold text-barber-white">{barberShopName || "Your Business"}</h2>
+              
+              <div className="mt-4 w-full p-4 bg-zinc-900/50 rounded-lg border border-zinc-800 text-left">
+                <label className="text-[10px] font-bold text-barber-gold uppercase flex items-center gap-1 mb-2">
+                  <LinkIcon size={12}/> Friendly ID (Slug)
+                </label>
+                <input 
+                  value={slug}
+                  onChange={handleSlugChange}
+                  placeholder="ex: my-shop"
+                  className="bg-transparent border-b border-zinc-700 w-full text-sm text-white focus:border-barber-gold outline-none pb-1"
+                />
+              </div>
+            </div>
+
+            <div className="bg-barber-black border border-zinc-800 rounded-xl p-6 shadow-xl">
+              <h3 className="text-sm font-bold text-barber-white mb-4 flex items-center gap-2">
+                <Globe size={16} className="text-barber-gold"/> Region & Timezone
+              </h3>
+              
+              <div className="space-y-4">
+                <div>
+                  <label className="text-xs text-barber-gray block mb-1">Business Location</label>
+                  <select 
+                    value={country}
+                    onChange={handleCountryChange}
+                    className="w-full bg-zinc-900 border border-zinc-800 rounded p-2 text-sm text-white focus:border-barber-gold outline-none"
+                  >
+                    {Object.keys(COUNTRY_CONFIG).map((key) => (
+                      <option key={key} value={key}>
+                        {COUNTRY_CONFIG[key].flag} {COUNTRY_CONFIG[key].name} ({COUNTRY_CONFIG[key].currency})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="text-xs text-barber-gray block mb-1">Local Timezone</label>
+                  <select 
+                    value={timezone}
+                    onChange={(e) => setTimezone(e.target.value)}
+                    className="w-full bg-zinc-900 border border-zinc-800 rounded p-2 text-sm text-white focus:border-barber-gold outline-none"
+                  >
+                    {TIMEZONE_OPTIONS[country]?.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  
+                  <div className="mt-4 p-3 bg-barber-gold/10 border border-barber-gold/20 rounded-lg">
+                    <div className="flex items-start gap-2">
+                      <Info size={14} className="text-barber-gold shrink-0 mt-0.5" />
+                      <p className="text-[10px] text-zinc-400 leading-tight">
+                        <span className="text-barber-gold font-bold">Note:</span> Regardless of your location, your AI Concierge will operate via a dedicated <span className="text-white">US Number (+1)</span>.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* COLUNA DIREITA: CONFIGURAÇÕES GERAIS E HORÁRIOS */}
+          <div className="lg:col-span-2 space-y-6">
+            <div className="bg-barber-black border border-zinc-800 rounded-xl p-6 shadow-xl space-y-6">
+              <h3 className="text-lg font-bold text-barber-white flex items-center gap-2 border-b border-zinc-800 pb-4">
+                <Building size={20} className="text-barber-gold"/> Business Details
+              </h3>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <Input label="Business Name" value={barberShopName} onChange={e => setBarberShopName(e.target.value)} />
+                
+                <div>
+                  <label className="text-sm text-barber-gray font-medium mb-1 block">Your Personal Phone</label>
+                  <div className="flex gap-2">
+                    <div className="bg-zinc-900 border border-zinc-800 rounded p-3 text-sm text-zinc-500 flex items-center">
+                      +{COUNTRY_CONFIG[country].ddi}
+                    </div>
+                    <Input 
+                      value={whatsapp} 
+                      onChange={handlePhoneChange} 
+                      placeholder="Phone number" 
+                    />
+                  </div>
+                  <p className="text-[10px] text-zinc-500 mt-1.5 ml-1">
+                    The AI Agent will use a separate <span className="text-zinc-300">Concierge Number (+1)</span>.
+                  </p>
+                </div>
+              </div>
+              <Input label="Full Address" value={address} onChange={e => setAddress(e.target.value)} />
+            </div>
+
+            <div className="bg-barber-black border border-zinc-800 rounded-xl p-6 shadow-xl space-y-6">
+              <h3 className="text-lg font-bold text-barber-white flex items-center gap-2 border-b border-zinc-800 pb-4">
+                <Clock size={20} className="text-barber-gold"/> Operating Hours
+              </h3>
+              
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <Input label="Opens at" type="time" value={openTime} onChange={e => setOpenTime(e.target.value)} />
+                <Input label="Closes at" type="time" value={closeTime} onChange={e => setCloseTime(e.target.value)} />
+                <Input label="Break (ex: 12:00-13:00)" value={breakTime} onChange={e => setBreakTime(e.target.value)} placeholder="12:00-13:00" />
+              </div>
+            </div>
+
+            <div className="flex justify-end">
+              <Button type="submit" loading={saving} className="w-auto px-12 h-14 text-lg">
+                Save All Changes
+              </Button>
+            </div>
+          </div>
+        </form>
+      )}
+    </AppLayout>
+  );
+}
+```
+
+
+--- ARQUIVO: src/pages/Pricing.jsx ---
+```javascript
+import React, { useState, useEffect } from 'react';
+import { AppLayout } from '../components/ui/AppLayout';
+import { Button } from '../components/ui/Button';
+import { Check, Zap, Globe, ShieldCheck } from 'lucide-react';
+import { getProfessionalProfile } from '../services/professionalService'; 
+import { useAuth } from '../contexts/AuthContext';
+import { useNavigate } from 'react-router-dom';
+
+// Global Stripe Checkout Link with 30-day trial
+const STRIPE_CHECKOUT_LINK = "https://buy.stripe.com/eVq3cp6Ly1NL9Mg1qRfnO03";
+
+export function Pricing() {
+  const { user } = useAuth();
+  const navigate = useNavigate();
+  const [country, setCountry] = useState('US');
+  const [userPlan, setUserPlan] = useState('free');
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    async function loadProfile() {
+      try {
+        const profile = await getProfessionalProfile();
+        if (profile) {
+          if (profile.country) setCountry(profile.country);
+          if (profile.plan) setUserPlan(profile.plan);
+        }
+      } catch (error) {
+        console.error("Error loading profile:", error);
+      } finally {
+        setLoading(false);
+      }
+    }
+    loadProfile();
+  }, []);
+
+  const handleSubscribe = () => {
+    if (userPlan === 'pro') {
+      navigate('/setup-pro');
+      return;
+    }
+
+    if (!user || !user.uid) {
+        alert("Session Error: Please log in again.");
+        return;
+    }
+    
+    // Attach barber ID for automatic activation via Webhook
+    const checkoutUrl = `${STRIPE_CHECKOUT_LINK}?client_reference_id=${user.uid}`;
+    window.location.href = checkoutUrl;
+  };
+
+  const config = {
+    US: { currency: '$', totalPlan: '29' },
+    BR: { currency: 'R$', totalPlan: '97' },
+    PT: { currency: '€', totalPlan: '19' }
+  }[country] || { currency: '$', totalPlan: '29' };
+
+  const plans = [
+    {
+      id: 'free',
+      name: "Starter",
+      price: `${config.currency}0`,
+      description: "Basic management for solo professionals.",
+      features: [
+        "Manual Digital Calendar",
+        "Unlimited Services",
+        "Basic Business Profile",
+        "Manual Appointment Entries"
+      ],
+      buttonText: userPlan === 'free' ? "Current Level" : "Basic Version",
+      variant: userPlan === 'free' ? "ghost" : "ghost",
+      action: () => {}
+    },
+    {
+      id: 'pro',
+      name: "AI Concierge",
+      price: `${config.currency}${config.totalPlan}`,
+      period: "/mo",
+      description: "Complete automation with 30-day trial.",
+      features: [
+        "24/7 AI Receptionist (WhatsApp)",
+        "Dedicated US (+1) Phone Number",
+        "First 30 days FREE (Trial)",
+        "Real-time Automated Booking",
+        "Instant Global Activation"
+      ],
+      buttonText: userPlan === 'pro' ? "Go to Setup" : "Start 30-Day Free Trial",
+      variant: "primary",
+      highlight: true,
+      action: handleSubscribe
+    }
+  ];
+
+  return (
+    <AppLayout>
+      <header className="mb-12">
+        <h1 className="text-4xl font-black text-barber-white tracking-tighter uppercase italic text-left">
+          Choose Your <span className="text-barber-gold">Level</span>
+        </h1>
+        <p className="text-barber-gray mt-2 font-bold uppercase tracking-widest text-xs italic opacity-80 text-left">
+          Scale your business with the power of US-based AI automation.
+        </p>
+      </header>
+
+      {loading ? (
+        <div className="flex justify-center py-20">
+          <div className="w-10 h-10 border-4 border-barber-gold border-t-transparent rounded-full animate-spin"></div>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-8 max-w-5xl mx-auto">
+          {plans.map((plan) => (
+            <div 
+              key={plan.id} 
+              className={`
+                relative bg-barber-black p-8 rounded-3xl border transition-all duration-300 flex flex-col
+                ${plan.highlight 
+                  ? 'border-barber-gold shadow-[0_0_40px_rgba(197,160,89,0.15)] scale-105 z-10' 
+                  : 'border-zinc-800 opacity-90 hover:opacity-100'
+                }
+              `}
+            >
+              {plan.highlight && (
+                <div className="absolute -top-4 left-1/2 -translate-x-1/2 bg-barber-gold text-black px-4 py-1 rounded-full text-[10px] font-black uppercase tracking-widest">
+                  Ready for Global Authority
+                </div>
+              )}
+
+              <div className="mb-8 text-left">
+                <h2 className="text-2xl font-black text-barber-white uppercase italic tracking-tighter mb-1">{plan.name}</h2>
+                <div className="flex items-baseline gap-1">
+                  <span className="text-5xl font-black text-barber-white tracking-tighter">{plan.price}</span>
+                  <span className="text-barber-gray font-bold text-sm uppercase">{plan.period}</span>
+                </div>
+                <p className="text-sm text-barber-gray mt-3 font-medium leading-relaxed italic">{plan.description}</p>
+              </div>
+              
+              <ul className="space-y-4 mb-10 flex-1">
+                {plan.features.map(f => (
+                  <li key={f} className="flex items-start gap-3 text-sm text-barber-white/90 font-bold uppercase tracking-tight italic text-left">
+                    <Check size={18} className="text-barber-gold shrink-0 mt-0.5" /> 
+                    <span>{f}</span>
+                  </li>
+                ))}
+              </ul>
+
+              <Button 
+                variant={plan.variant} 
+                onClick={plan.action}
+                disabled={plan.id === 'free' && userPlan === 'free'}
+                className={`h-14 text-lg font-black uppercase tracking-tighter italic ${plan.highlight ? 'shadow-xl shadow-barber-red/20' : ''}`}
+              >
+                {plan.buttonText}
+              </Button>
+
+              {plan.highlight && (
+                <div className="mt-6 flex items-center justify-center gap-4 text-zinc-600">
+                   <div className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest">
+                      <Globe size={12} /> US Virtual DID
+                   </div>
+                   <div className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest">
+                      <ShieldCheck size={12} /> Secure Stripe
+                   </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="mt-16 p-8 bg-zinc-900/30 border border-zinc-800 rounded-2xl text-center max-w-3xl mx-auto">
+        <h3 className="text-white font-bold mb-2 uppercase tracking-tighter italic">Why the International Concierge?</h3>
+        <p className="text-zinc-500 text-sm leading-relaxed font-medium italic">
+          By utilizing our <span className="text-barber-gold font-bold italic">US Virtual DID System</span>, we bypass local bureaucratic hurdles. 
+          Your international (+1) line is activated instantly, allowing your AI to serve clients and handle WhatsApp bookings with global stability and premium authority.
+        </p>
+      </div>
+    </AppLayout>
+  );
+}
+```
+
+
+--- ARQUIVO: src/pages/SetupPro.jsx ---
+```javascript
+import React, { useState, useEffect } from 'react';
+import { AppLayout } from '../components/ui/AppLayout';
+import { Button } from '../components/ui/Button';
+import { 
+  Globe, 
+  Loader2, 
+  CheckCircle, 
+  Copy, 
+  Check, 
+  Download,
+  ShieldCheck,
+  Zap,
+  MapPin,
+  Lock
+} from 'lucide-react';
+import { QRCodeCanvas } from 'qrcode.react'; 
+import { provisionConciergeNumber, getProfessionalProfile } from '../services/professionalService'; 
+
+// Opções de Area Codes dos EUA
+const US_AREA_CODES = [
+  { code: '305', city: 'Miami, FL' },
+  { code: '212', city: 'New York, NY' },
+  { code: '407', city: 'Orlando, FL' },
+  { code: '702', city: 'Las Vegas, NV' },
+  { code: 'random', city: 'Instant Allocation' },
+];
+
+const CONCIERGE_NUMBER = "+14454563363"; 
+
+export function SetupPro() {
+  const [profile, setProfile] = useState(null);
+  const [pageLoading, setPageLoading] = useState(true);
+  const [activationLoading, setActivationLoading] = useState(false);
+  const [tenantId, setTenantId] = useState(null);
+  const [isActivated, setIsActivated] = useState(false); 
+  const [copied, setCopied] = useState(false); 
+  const [selectedAreaCode, setSelectedAreaCode] = useState('random');
+
+  useEffect(() => {
+    async function loadProfile() {
+      try {
+        const data = await getProfessionalProfile();
+        if (data && data.plan === 'pro') {
+          setProfile(data);
+          setTenantId(data.id); 
+          
+          if (data.phone && data.numberCountry === 'US') {
+             setIsActivated(true);
+          }
+        }
+      } catch (error) {
+        console.error("Error fetching profile:", error);
+      } finally {
+        setPageLoading(false);
+      }
+    }
+    loadProfile();
+  }, []);
+
+  const handleActivate = async () => {
+    setActivationLoading(true);
+    try {
+      await provisionConciergeNumber({ areaCode: selectedAreaCode }); 
+      setIsActivated(true);
+    } catch (error) {
+      alert("Error activating Concierge. Please contact support.");
+    } finally {
+      setActivationLoading(false);
+    }
+  };
+
+  const copyToClipboard = (text) => {
+    navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  if (pageLoading) {
+    return (
+      <AppLayout>
+        <div className="flex flex-col items-center justify-center mt-40 gap-4">
+          <Loader2 className="animate-spin text-barber-gold" size={48} />
+          <p className="text-barber-gray animate-pulse font-medium tracking-tight">Finalizing your pro dashboard...</p>
+        </div>
+      </AppLayout>
+    );
+  }
+
+  if (!profile || profile.plan !== 'pro') {
+     return (
+      <AppLayout>
+        <div className="max-w-md mx-auto mt-20 text-center bg-red-500/10 border border-red-500/50 p-8 rounded-2xl">
+          <ShieldCheck className="text-red-500 mx-auto mb-4" size={48} />
+          <h2 className="text-white font-bold text-xl mb-2">Pro Feature Only</h2>
+          <p className="text-zinc-400 text-sm mb-6">Upgrade your account to activate your AI Concierge and get your dedicated US number.</p>
+          <Button onClick={() => window.location.href = '/pricing'}>View Pro Plans</Button>
+        </div>
+      </AppLayout>
+     );
+  }
+
+  const identifier = profile.slug || tenantId;
+  const businessName = profile.barberShopName || "the professional";
+  const initialMessage = `Hello! I'd like to book an appointment with ${businessName}. (ID: ${identifier})`;
+  const whatsappLink = `https://wa.me/${CONCIERGE_NUMBER.replace(/\D/g, '')}?text=${encodeURIComponent(initialMessage)}`;
+
+  // VIEW: SETUP / ACTIVATION
+  if (!isActivated) {
+    return (
+        <AppLayout>
+            <div className="max-w-2xl mx-auto mt-10">
+                <div className="bg-barber-black border border-zinc-800 p-8 md:p-12 rounded-3xl shadow-2xl">
+                    <div className="flex items-center gap-4 mb-8">
+                      <div className="bg-barber-gold/10 p-4 rounded-2xl text-barber-gold border border-barber-gold/20">
+                          <Zap size={32} className="fill-current" />
+                      </div>
+                      <div>
+                        <h1 className="text-3xl font-black text-barber-white tracking-tighter uppercase italic text-left">Your 30-Day Trial is Active!</h1>
+                        <p className="text-barber-gray text-sm text-left">Let's connect your AI Concierge to a phone number.</p>
+                      </div>
+                    </div>
+
+                    <div className="bg-zinc-900/50 p-6 rounded-2xl border border-zinc-800 mb-8 text-left">
+                      <h3 className="text-white font-bold mb-4 flex items-center gap-2">
+                        <MapPin size={18} className="text-barber-gold" /> Choose your preferred Area Code
+                      </h3>
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                        {US_AREA_CODES.map((item) => (
+                          <button
+                            key={item.code}
+                            type="button"
+                            onClick={() => setSelectedAreaCode(item.code)}
+                            className={`p-4 rounded-xl border text-left transition-all ${
+                              selectedAreaCode === item.code 
+                              ? 'bg-barber-gold border-barber-gold text-black' 
+                              : 'bg-black border-zinc-800 text-zinc-500 hover:border-zinc-600'
+                            }`}
+                          >
+                            <p className="text-lg font-black">{item.code === 'random' ? 'Any' : item.code}</p>
+                            <p className="text-[10px] font-bold uppercase opacity-80 leading-none mt-1">{item.city}</p>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    
+                    <div className="space-y-4 mb-10 text-left">
+                      <div className="flex items-start gap-4 p-4 bg-barber-gold/5 rounded-xl border border-barber-gold/10">
+                        <CheckCircle size={20} className="text-barber-gold shrink-0 mt-1" />
+                        <div>
+                          <p className="text-sm font-bold text-white italic uppercase tracking-tighter">Ready to work 24/7</p>
+                          <p className="text-xs text-zinc-500 leading-relaxed">Your AI assistant will use this number to talk to clients and fill your schedule while you're busy with your clippers.</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <Button onClick={handleActivate} loading={activationLoading} className="w-full h-16 text-xl shadow-xl shadow-barber-gold/10 font-black italic uppercase tracking-tighter">
+                        {activationLoading ? "Setting up your line..." : `Activate My Assistant Now`}
+                    </Button>
+                </div>
+            </div>
+        </AppLayout>
+    );
+  }
+
+  // VIEW: LIVE / ACTIVATED
+  return (
+    <AppLayout>
+      <div className="max-w-3xl mx-auto mt-6">
+        <div className="bg-barber-black border-2 border-barber-gold p-10 rounded-3xl shadow-2xl text-center relative overflow-hidden">
+          
+          <div className="absolute top-0 right-0 bg-barber-gold text-black px-6 py-1 font-black text-[10px] uppercase tracking-widest rounded-bl-xl italic">
+            30-Day Trial Active
+          </div>
+
+          <CheckCircle size={64} className="text-green-500 mx-auto mb-6" />
+          <h1 className="text-4xl font-black text-barber-white mb-2 uppercase italic tracking-tighter">You're on Autopilot</h1>
+          <p className="text-barber-gray mb-10 max-w-md mx-auto font-medium">
+            Your AI Concierge is now live and taking bookings. <br/>
+            <span className="text-white font-bold">Share your link below to get started.</span>
+          </p>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-10 items-start">
+            
+            <div className="bg-zinc-900 p-8 rounded-2xl border border-zinc-800 flex flex-col items-center shadow-inner">
+                <div className="bg-white p-4 rounded-2xl mb-6 shadow-2xl">
+                    <QRCodeCanvas 
+                        id="qr-concierge"
+                        value={whatsappLink} 
+                        size={200}
+                        level={"H"}
+                    />
+                </div>
+                <p className="text-[10px] text-zinc-500 font-bold uppercase tracking-widest mb-4">Clients scan this to book</p>
+                <button 
+                    type="button"
+                    onClick={() => {
+                        const canvas = document.getElementById('qr-concierge');
+                        const url = canvas.toDataURL("image/png");
+                        const link = document.createElement('a');
+                        link.download = `my-booking-qr.png`;
+                        link.href = url;
+                        link.click();
+                    }}
+                    className="flex items-center gap-2 text-zinc-400 text-xs hover:text-white transition-colors font-bold uppercase tracking-tighter"
+                >
+                    <Download size={14} /> Download Image
+                </button>
+            </div>
+
+            <div className="flex flex-col gap-6 text-left">
+                <div className="bg-zinc-900/80 p-5 rounded-2xl border border-zinc-800">
+                    <label className="text-[10px] font-black text-zinc-500 uppercase mb-2 block tracking-widest italic">Your Professional AI Line</label>
+                    <span className="text-2xl font-mono font-bold text-barber-gold tracking-tighter">{CONCIERGE_NUMBER}</span>
+                </div>
+
+                <div className="bg-zinc-900/80 p-5 rounded-2xl border border-zinc-800">
+                    <label className="text-[10px] font-black text-zinc-500 uppercase mb-2 block tracking-widest italic">Your Booking Link</label>
+                    <div className="flex items-center gap-3 mt-1">
+                        <div className="bg-black/50 text-[10px] text-zinc-400 w-full p-3 rounded-lg truncate font-mono border border-zinc-800/50">
+                            {whatsappLink}
+                        </div>
+                        <button 
+                            type="button"
+                            onClick={() => copyToClipboard(whatsappLink)}
+                            className="p-3 bg-barber-gold text-black rounded-lg hover:bg-yellow-600 transition-all shrink-0 active:scale-95"
+                        >
+                            {copied ? <Check size={20} /> : <Copy size={20} />}
+                        </button>
+                    </div>
+                </div>
+
+                <div className="p-5 border-l-4 border-barber-gold bg-zinc-900/50 rounded-r-2xl">
+                    <div className="flex items-center gap-2 mb-2 text-left">
+                      <Lock size={12} className="text-zinc-500" />
+                      <h4 className="text-zinc-400 text-[10px] font-black uppercase tracking-widest italic">Privacy Guaranteed</h4>
+                    </div>
+                    <p className="text-[10px] text-zinc-500 leading-relaxed font-medium text-left">
+                        Schedy AI only monitors booking requests sent to your dedicated line. <span className="text-zinc-300">Your personal WhatsApp conversations stay private.</span>
+                    </p>
+                </div>
+            </div>
+          </div>
+
+          <div className="mt-12 pt-8 border-t border-zinc-800 flex flex-col sm:flex-row gap-4">
+            <Button onClick={() => window.location.href = '/dashboard'} className="flex-1 h-14 uppercase font-black italic tracking-tighter shadow-lg">
+              View My Schedule
+            </Button>
+            <Button onClick={() => window.location.href = '/profile'} variant="outline" className="flex-1 h-14 uppercase font-black italic tracking-tighter border-zinc-800 text-zinc-400 hover:text-white">
+              Edit Business Info
+            </Button>
+          </div>
+        </div>
+      </div>
+      
+      <p className="text-center text-zinc-700 text-[9px] mt-8 uppercase font-bold tracking-[0.3em] italic">
+          International Concierge Powered by Schedy AI
+      </p>
+    </AppLayout>
+  );
+}
+
+export default SetupPro;
+```
+
+
+--- ARQUIVO: src/pages/Admin.jsx ---
+```javascript
+import React, { useState, useEffect } from 'react';
+import { AppLayout } from '../components/ui/AppLayout';
+import { Button } from '../components/ui/Button';
+import { Input } from '../components/ui/Input';
+import { Modal } from '../components/ui/Modal';
+import { 
+  Users, 
+  Globe, 
+  Zap, 
+  Trash2, 
+  Search, 
+  Bot, 
+  Save, 
+  Database, 
+  Lock,
+  Sparkles,
+  Briefcase,
+  Plus,
+  TrendingUp,
+  DollarSign,
+  CheckCircle,
+  Clock,
+  CreditCard,
+  RefreshCw,
+  Tag
+} from 'lucide-react';
+import { db } from '../services/firebase';
+import { doc, getDoc, updateDoc } from 'firebase/firestore';
+import { 
+  getAllTenants, 
+  adminUpdateTenant, 
+  adminDeleteTenant,
+  createSalesperson,
+  getAllSalespeople,
+  getAllPayoutRequests,
+  adminApprovePayout
+} from '../services/adminService';
+
+// 1. CONFIGURAÇÃO DE PAÍSES (Incluindo Grã-Bretanha)
+const SUPPORTED_COUNTRIES = {
+  US: { name: 'United States', ddi: '1', flag: '🇺🇸' },
+  BR: { name: 'Brasil', ddi: '55', flag: '🇧🇷' },
+  PT: { name: 'Portugal', ddi: '351', flag: '🇵🇹' },
+  ES: { name: 'España', ddi: '34', flag: '🇪🇸' },
+  FR: { name: 'France', ddi: '33', flag: '🇫🇷' },
+  GB: { name: 'United Kingdom', ddi: '44', flag: '🇬🇧' }, // Adicionado conforme solicitado
+};
+
+export function Admin() {
+  const [activeTab, setActiveTab] = useState('users'); 
+  const [commercialSubTab, setCommercialSubTab] = useState('partners'); 
+  const [tenants, setTenants] = useState([]); 
+  const [salespeople, setSalespeople] = useState([]);
+  const [payoutRequests, setPayoutRequests] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [searchTerm, setSearchTerm] = useState('');
+
+  // --- ESTADOS DO COMERCIAL ---
+  const [isSalesModalOpen, setIsSalesModalOpen] = useState(false);
+  const [newSales, setNewSales] = useState({ name: '', email: '', phone: '', country: 'US', referralCode: '' });
+  const [salesLoading, setSalesLoading] = useState(false);
+  const [payoutProcessing, setPayoutProcessing] = useState(null);
+
+  // --- ESTADOS DA IA ---
+  const [aiConfig, setAiConfig] = useState({ additionalContext: '' });
+  const [aiLoading, setAiLoading] = useState(true);
+  const [aiSaving, setAiSaving] = useState(false);
+
+  const MASTER_PROMPT_PREVIEW = `You are Schedy AI, the Expert Concierge for "{{businessName}}".
+Your goal is to manage the schedule while building a rich database of clients.
+
+--- CORE LOGIC ---
+- Identify Client Identity
+- Detect Intent (Book/Reschedule/Cancel)
+- Check Real-time Conflicts
+- Proactive CRM Data Mining
+
+(This core logic is protected to ensure system stability)`;
+
+  useEffect(() => {
+    loadInitialData();
+  }, []);
+
+  const loadInitialData = async () => {
+    setLoading(true);
+    try {
+      const [tenantsData, salesData, payoutsData] = await Promise.all([
+        getAllTenants(),
+        getAllSalespeople(),
+        getAllPayoutRequests()
+      ]);
+      setTenants(tenantsData);
+      setSalespeople(salesData);
+      setPayoutRequests(payoutsData);
+      await loadAIConfig();
+    } catch (error) {
+      console.error("Error loading admin data:", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadAIConfig = async () => {
+    try {
+      const docRef = doc(db, 'settings', 'ai_config');
+      const snap = await getDoc(docRef);
+      if (snap.exists()) setAiConfig({ additionalContext: snap.data().additionalContext || '' });
+    } catch (error) { console.error(error); }
+    finally { setAiLoading(false); }
+  };
+
+  // --- LÓGICA DE FORMULÁRIO COMERCIAL INTELIGENTE ---
+
+  // Gera código automático baseado no nome (Ex: RIC452)
+  const handleSalesNameChange = (val) => {
+    const prefix = val.substring(0, 3).toUpperCase().replace(/[^A-Z]/g, 'SAL');
+    const random = Math.floor(100 + Math.random() * 900);
+    const suggestedCode = val.length >= 3 ? `${prefix}${random}` : '';
+    setNewSales({ ...newSales, name: val, referralCode: suggestedCode });
+  };
+
+  // Máscara de telefone dinâmica por país
+  const handleSalesPhoneChange = (e) => {
+    let value = e.target.value.replace(/\D/g, "");
+    const country = newSales.country;
+
+    if (country === 'BR') {
+      value = value.slice(0, 11).replace(/^(\d{2})(\d)/g, '($1) $2').replace(/(\d)(\d{4})$/, '$1-$2');
+    } else if (country === 'US') {
+      value = value.slice(0, 10).replace(/^(\d{3})(\d)/g, '($1) $2').replace(/(\d{3})(\d)/, '$1-$2');
+    } else if (country === 'GB') {
+      value = value.slice(0, 11).replace(/(\d{4})(\d{6})/, '$1 $2');
+    } else {
+      // Padrão Europeu
+      value = value.slice(0, 9).replace(/(\d{3})(\d{3})(\d{3})/, '$1 $2 $3');
+    }
+    setNewSales({ ...newSales, phone: value });
+  };
+
+  const handleCreateSales = async (e) => {
+    e.preventDefault();
+    setSalesLoading(true);
+    try {
+      const cleanCode = newSales.referralCode.toUpperCase().replace(/\s+/g, '');
+      await createSalesperson({ ...newSales, referralCode: cleanCode });
+      alert("Salesperson registered successfully!");
+      setIsSalesModalOpen(false);
+      setNewSales({ name: '', email: '', phone: '', country: 'US', referralCode: '' });
+      loadInitialData();
+    } catch (error) {
+      alert("Error creating salesperson.");
+    } finally {
+      setSalesLoading(false);
+    }
+  };
+
+  const handleApprovePayout = async (payout) => {
+    if (!confirm(`Confirm that you have paid $${payout.amount} to ${payout.salespersonName}?`)) return;
+    setPayoutProcessing(payout.id);
+    try {
+      await adminApprovePayout(payout.id, payout.salespersonId, payout.amount);
+      alert("Payout marked as paid!");
+      loadInitialData();
+    } catch (error) {
+      alert("Error processing payout.");
+    } finally {
+      setPayoutProcessing(null);
+    }
+  };
+
+  // --- OUTROS HANDLERS (Preservados) ---
+  const handleSaveAIConfig = async () => {
+    setAiSaving(true);
+    try {
+      const docRef = doc(db, 'settings', 'ai_config');
+      await updateDoc(docRef, { additionalContext: aiConfig.additionalContext, updatedAt: new Date().toISOString() });
+      alert("AI Training saved!");
+    } catch (error) { alert("Failed to save."); }
+    finally { setAiSaving(false); }
+  };
+
+  const togglePlan = async (tenant) => {
+    const newPlan = tenant.plan === 'pro' ? 'free' : 'pro';
+    if (confirm(`Change plan for ${tenant.name}?`)) {
+      await adminUpdateTenant(tenant.id, { plan: newPlan });
+      loadInitialData();
+    }
+  };
+
+  const stats = {
+    total: tenants.length,
+    pro: tenants.filter(t => t.plan === 'pro').length,
+    salesCount: salespeople.length,
+    pendingPayouts: payoutRequests.filter(p => p.status === 'pending').length
+  };
+
+  return (
+    <AppLayout>
+      <header className="mb-8 flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-black text-barber-white uppercase italic tracking-tighter flex items-center gap-2">
+            <Sparkles className="text-barber-gold" size={24} />
+            Schedy Management
+          </h1>
+          <p className="text-barber-gray text-sm font-bold uppercase tracking-widest opacity-70">Owner Control Panel</p>
+        </div>
+
+        <div className="flex bg-zinc-900 p-1 rounded-xl border border-zinc-800">
+          <TabButton active={activeTab === 'users'} onClick={() => setActiveTab('users')} icon={<Users size={16}/>} label="Users" />
+          <TabButton active={activeTab === 'commercial'} onClick={() => setActiveTab('commercial')} icon={<Briefcase size={16}/>} label="Commercial" />
+          <TabButton active={activeTab === 'ai'} onClick={() => setActiveTab('ai')} icon={<Bot size={16}/>} label="AI Training" />
+        </div>
+      </header>
+
+      {/* STATS CARDS */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+        <StatCard icon={<Users/>} label="Total Users" value={stats.total} color="text-white" />
+        <StatCard icon={<Zap/>} label="PRO Subs" value={stats.pro} color="text-barber-gold" />
+        <StatCard icon={<Briefcase/>} label="Sales Team" value={stats.salesCount} color="text-blue-400" />
+        <StatCard icon={<Clock/>} label="Pending Payouts" value={stats.pendingPayouts} color="text-red-400" />
+      </div>
+
+      {/* --- ABA: USERS --- */}
+      {activeTab === 'users' && (
+        <div className="bg-barber-black border border-zinc-800 rounded-3xl overflow-hidden shadow-xl">
+          <div className="p-6 border-b border-zinc-800 flex items-center gap-4 bg-zinc-900/30">
+            <Search className="text-zinc-500" size={20} />
+            <input type="text" placeholder="Search professionals..." className="bg-transparent border-none outline-none text-white w-full text-sm font-medium" onChange={(e) => setSearchTerm(e.target.value)} />
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-zinc-900 text-barber-gray uppercase text-[10px] font-black tracking-widest">
+                <tr>
+                  <th className="p-6">Professional</th>
+                  <th className="p-6">Country</th>
+                  <th className="p-6">Plan</th>
+                  <th className="p-6">Referred By</th>
+                  <th className="p-6 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-800">
+                {tenants.filter(t => t.name?.toLowerCase().includes(searchTerm.toLowerCase())).map(tenant => (
+                  <tr key={tenant.id} className="hover:bg-zinc-900/50 transition-colors">
+                    <td className="p-6">
+                      <div className="font-bold text-white">{tenant.name}</div>
+                      <div className="text-xs text-zinc-500">{tenant.email}</div>
+                    </td>
+                    <td className="p-6 font-bold text-zinc-400">{tenant.country}</td>
+                    <td className="p-6">
+                      <span className={`px-3 py-1 rounded-full text-[10px] font-black uppercase ${tenant.plan === 'pro' ? 'bg-barber-gold/20 text-barber-gold' : 'bg-zinc-800 text-zinc-500'}`}>{tenant.plan}</span>
+                    </td>
+                    <td className="p-6 font-mono text-xs text-barber-gold">{tenant.referredBy || '---'}</td>
+                    <td className="p-6 text-right space-x-2">
+                      <button onClick={() => togglePlan(tenant)} className="p-2 text-zinc-500 hover:text-barber-gold"><Zap size={18} /></button>
+                      <button onClick={() => adminDeleteTenant(tenant.id).then(loadInitialData)} className="p-2 text-zinc-500 hover:text-red-500"><Trash2 size={18} /></button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* --- ABA: COMMERCIAL --- */}
+      {activeTab === 'commercial' && (
+        <div className="space-y-6">
+          <div className="flex flex-col md:flex-row justify-between items-center gap-4">
+            <div className="flex bg-zinc-900 p-1 rounded-lg border border-zinc-800 w-full md:w-auto">
+                <button onClick={() => setCommercialSubTab('partners')} className={`flex-1 md:flex-none px-4 py-1.5 rounded-md text-[10px] font-black uppercase transition-all ${commercialSubTab === 'partners' ? 'bg-zinc-800 text-white' : 'text-zinc-500'}`}>Partners List</button>
+                <button onClick={() => setCommercialSubTab('payouts')} className={`flex-1 md:flex-none px-4 py-1.5 rounded-md text-[10px] font-black uppercase transition-all ${commercialSubTab === 'payouts' ? 'bg-zinc-800 text-white' : 'text-zinc-500'}`}>Payout Requests {stats.pendingPayouts > 0 && <span className="ml-1 bg-red-500 text-white px-1.5 rounded-full text-[8px]">{stats.pendingPayouts}</span>}</button>
+            </div>
+            {commercialSubTab === 'partners' && (
+                <Button onClick={() => setIsSalesModalOpen(true)} className="w-auto gap-2 px-6 h-10 text-xs"><Plus size={16} /> Add Salesperson</Button>
+            )}
+          </div>
+
+          <div className="bg-barber-black border border-zinc-800 rounded-3xl overflow-hidden shadow-xl">
+            {commercialSubTab === 'partners' ? (
+                <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                        <thead className="bg-zinc-900 text-barber-gray uppercase text-[10px] font-black tracking-widest">
+                            <tr><th className="p-6">Salesperson</th><th className="p-6">Referral Code</th><th className="p-6">Clients</th><th className="p-6">Balance</th><th className="p-6">Lifetime</th><th className="p-6 text-right">Actions</th></tr>
+                        </thead>
+                        <tbody className="divide-y divide-zinc-800">
+                            {salespeople.map(person => (
+                                <tr key={person.id} className="hover:bg-zinc-900/50 transition-colors">
+                                    <td className="p-6"><div className="font-bold text-white">{person.name}</div><div className="text-xs text-zinc-500">{person.email}</div></td>
+                                    <td className="p-6"><span className="bg-zinc-800 px-3 py-1 rounded font-mono text-barber-gold font-bold">{person.referralCode}</span></td>
+                                    <td className="p-6 font-bold text-white">{person.activeClients || 0}</td>
+                                    <td className="p-6 font-bold text-barber-gold">${(person.currentBalance || 0).toFixed(2)}</td>
+                                    <td className="p-6 font-bold text-green-400">${(person.totalEarnings || 0).toFixed(2)}</td>
+                                    <td className="p-6 text-right"><button className="p-2 text-zinc-500 hover:text-barber-gold"><TrendingUp size={18} /></button></td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            ) : (
+                <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                        <thead className="bg-zinc-900 text-barber-gray uppercase text-[10px] font-black tracking-widest">
+                            <tr><th className="p-6">Salesperson</th><th className="p-6">Amount</th><th className="p-6">Payment Info</th><th className="p-6">Status</th><th className="p-6 text-right">Action</th></tr>
+                        </thead>
+                        <tbody className="divide-y divide-zinc-800">
+                            {payoutRequests.length === 0 ? (
+                                <tr><td colSpan="5" className="p-10 text-center text-zinc-600 italic">No payout requests found.</td></tr>
+                            ) : (
+                                payoutRequests.map(payout => (
+                                    <tr key={payout.id} className="hover:bg-zinc-900/50 transition-colors">
+                                        <td className="p-6 font-bold text-white">{payout.salespersonName}</td>
+                                        <td className="p-6 font-black text-barber-gold">${payout.amount.toFixed(2)}</td>
+                                        <td className="p-6"><div className="max-w-[200px] truncate text-xs text-zinc-400 italic" title={payout.paymentInfo}>{payout.paymentInfo}</div></td>
+                                        <td className="p-6"><span className={`text-[9px] font-black uppercase px-2 py-1 rounded ${payout.status === 'paid' ? 'bg-green-500/10 text-green-500' : 'bg-red-500/10 text-red-500 animate-pulse'}`}>{payout.status}</span></td>
+                                        <td className="p-6 text-right">{payout.status === 'pending' && (<button onClick={() => handleApprovePayout(payout)} disabled={payoutProcessing === payout.id} className="bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded-lg text-[10px] font-black uppercase flex items-center gap-1 ml-auto"><CheckCircle size={12} /> {payoutProcessing === payout.id ? '...' : 'Mark as Paid'}</button>)}</td>
+                                    </tr>
+                                ))
+                            )}
+                        </tbody>
+                    </table>
+                </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ABA: AI TRAINING */}
+      {activeTab === 'ai' && (
+        <div className="bg-barber-black border border-zinc-800 rounded-3xl p-8 shadow-2xl">
+           <div className="flex items-center justify-between mb-8">
+              <div className="flex items-center gap-3">
+                <div className="bg-barber-gold/10 p-3 rounded-2xl text-barber-gold border border-barber-gold/20"><Bot size={28} /></div>
+                <div><h2 className="text-xl font-black text-barber-white uppercase italic tracking-tighter">AI Intelligence Manager</h2><p className="text-zinc-500 text-[10px] font-black uppercase tracking-[0.2em]">Core Rules & Custom Training</p></div>
+              </div>
+              <Button onClick={handleSaveAIConfig} loading={aiSaving} className="w-auto px-8 h-12 uppercase font-black italic tracking-tighter text-sm"><Save size={18} className="mr-2" /> Save Training</Button>
+           </div>
+           <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              <div className="space-y-3 opacity-60"><label className="flex items-center gap-2 text-[10px] font-black text-zinc-500 uppercase tracking-[0.2em] italic"><Lock size={14} /> Master System Instructions (Protected)</label><textarea value={MASTER_PROMPT_PREVIEW} readOnly className="w-full bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 text-xs text-zinc-500 min-h-[350px] font-mono leading-relaxed cursor-not-allowed" /></div>
+              <div className="space-y-3"><label className="flex items-center gap-2 text-[10px] font-black text-barber-gold uppercase tracking-[0.2em] italic"><Database size={14} /> Knowledge Base & Custom Training</label><textarea value={aiConfig.additionalContext} onChange={(e) => setAiConfig({ ...aiConfig, additionalContext: e.target.value })} className="w-full bg-black border-2 border-zinc-800 rounded-2xl p-4 text-sm text-white focus:border-barber-gold outline-none min-h-[350px] font-medium leading-relaxed shadow-inner" placeholder="Write your rules here..." /></div>
+           </div>
+        </div>
+      )}
+
+      {/* MODAL: ADD SALESPERSON (Refatorado com Automação e Máscaras) */}
+      <Modal isOpen={isSalesModalOpen} onClose={() => setIsSalesModalOpen(false)} title="New Salesperson">
+        <form onSubmit={handleCreateSales} className="flex flex-col gap-4">
+          <Input 
+            label="Full Name" 
+            placeholder="Ex: Ricardo Silva"
+            value={newSales.name} 
+            onChange={e => handleSalesNameChange(e.target.value)} 
+            required 
+          />
+          
+          <Input label="Email Address" type="email" value={newSales.email} onChange={e => setNewSales({...newSales, email: e.target.value})} required />
+          
+          <div className="flex flex-col gap-1">
+            <label className="text-sm text-barber-gray font-medium">Country</label>
+            <select 
+              value={newSales.country} 
+              onChange={(e) => setNewSales({...newSales, country: e.target.value, phone: ''})} 
+              className="bg-barber-black border border-zinc-800 rounded p-3 text-barber-white outline-none focus:border-barber-gold transition-all"
+            >
+              {Object.keys(SUPPORTED_COUNTRIES).map(key => (
+                <option key={key} value={key}>{SUPPORTED_COUNTRIES[key].flag} {SUPPORTED_COUNTRIES[key].name}</option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="text-sm text-barber-gray font-medium mb-1 block">Phone Number</label>
+            <div className="flex gap-2">
+                <div className="bg-zinc-900 border border-zinc-800 rounded p-3 text-sm text-zinc-500 flex items-center font-bold min-w-[60px] justify-center">
+                    +{SUPPORTED_COUNTRIES[newSales.country].ddi}
+                </div>
+                <Input 
+                    placeholder="Phone number"
+                    value={newSales.phone} 
+                    onChange={handleSalesPhoneChange} 
+                    required 
+                />
+            </div>
+          </div>
+          
+          <div className="bg-zinc-900/50 p-4 rounded-xl border border-zinc-800 space-y-2">
+            <div className="flex items-center justify-between">
+                <label className="text-[10px] font-black text-barber-gold uppercase tracking-widest flex items-center gap-1">
+                    <Tag size={12} /> Referral Code
+                </label>
+                <button type="button" onClick={() => handleSalesNameChange(newSales.name)} className="text-[8px] text-zinc-500 hover:text-white uppercase font-bold flex items-center gap-1 transition-colors">
+                    <RefreshCw size={8} /> Regenerate
+                </button>
+            </div>
+            <input 
+                className="w-full bg-black border border-zinc-800 rounded-lg p-3 text-lg font-mono font-bold text-white focus:border-barber-gold outline-none"
+                value={newSales.referralCode} 
+                onChange={e => setNewSales({...newSales, referralCode: e.target.value.toUpperCase()})} 
+                required 
+            />
+            <p className="text-[9px] text-zinc-600 font-bold uppercase italic">This code is unique for this partner.</p>
+          </div>
+
+          <Button type="submit" loading={salesLoading} className="h-14 font-black uppercase italic tracking-tighter">
+            Register Sales Partner
+          </Button>
+        </form>
+      </Modal>
+    </AppLayout>
+  );
+}
+
+function TabButton({ active, onClick, icon, label }) {
+  return (
+    <button onClick={onClick} className={`flex items-center gap-2 px-6 py-2 rounded-lg text-xs font-black uppercase tracking-widest transition-all ${active ? 'bg-barber-gold text-black shadow-lg' : 'text-zinc-500 hover:text-white'}`}>
+      {icon} {label}
+    </button>
+  );
+}
+
+function StatCard({ icon, label, value, color }) {
+  return (
+    <div className="bg-barber-black border border-zinc-800 p-6 rounded-3xl shadow-lg hover:border-zinc-700 transition-all">
+      <div className={`${color} mb-3 opacity-80`}>{icon}</div>
+      <div className="text-3xl font-black text-white tracking-tighter italic">{value}</div>
+      <div className="text-[10px] text-barber-gray uppercase font-black tracking-[0.2em] mt-1">{label}</div>
+    </div>
+  );
+}
+```
+
+
+--- ARQUIVO: src/pages/Terms.jsx ---
+```javascript
+import React from 'react';
+import { AppLayout } from '../components/ui/AppLayout';
+import { Shield, Lock, FileCheck, Scale, Zap } from 'lucide-react';
+
+export function Terms() {
+  return (
+    <AppLayout>
+      <header className="mb-8">
+        <h1 className="text-2xl font-black text-barber-white uppercase italic tracking-tighter">Legal Documentation</h1>
+        <p className="text-barber-gray font-medium">Transparency and security for your business</p>
+      </header>
+
+      <div className="max-w-4xl mx-auto space-y-6">
+        
+        {/* Summary Card */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="bg-zinc-900/50 border border-zinc-800 p-5 rounded-2xl flex items-start gap-4">
+            <Shield className="text-barber-gold shrink-0" size={24} />
+            <div>
+              <h3 className="text-white font-bold text-sm uppercase tracking-tight">Data Protection (GDPR/LGPD)</h3>
+              <p className="text-zinc-500 text-xs mt-1 leading-relaxed">Your data and your clients' data are encrypted, isolated, and never sold to third parties.</p>
+            </div>
+          </div>
+          <div className="bg-zinc-900/50 border border-zinc-800 p-5 rounded-2xl flex items-start gap-4">
+            <Lock className="text-barber-gold shrink-0" size={24} />
+            <div>
+              <h3 className="text-white font-bold text-sm uppercase tracking-tight">Total Privacy</h3>
+              <p className="text-zinc-500 text-xs mt-1 leading-relaxed">AI Concierge only monitors booking-related messages. Personal chats remain private.</p>
+            </div>
+          </div>
+        </div>
+
+        {/* The Document Itself */}
+        <div className="bg-barber-black border border-zinc-800 rounded-3xl overflow-hidden shadow-2xl">
+          <div className="bg-zinc-900 px-8 py-5 border-b border-zinc-800 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <FileCheck size={18} className="text-barber-gold" />
+              <span className="text-xs font-bold text-barber-gray uppercase tracking-[0.2em]">Service Agreement</span>
+            </div>
+            <span className="text-[10px] font-black text-barber-gold bg-barber-gold/10 px-3 py-1 rounded-full uppercase italic">v1.1 - 30-Day Trial Update</span>
+          </div>
+          
+          <div className="p-8 text-barber-gray text-sm leading-relaxed space-y-8 overflow-y-auto max-h-[60vh] custom-scrollbar italic font-medium">
+            
+            <section>
+              <h2 className="text-barber-white font-black text-lg mb-3 flex items-center gap-2 uppercase tracking-tighter">
+                <Scale size={18} className="text-barber-gold" /> 1. Terms of Use
+              </h2>
+              <p>By using Schedy AI (operating as 'AI Concierge'), you agree to provide accurate information about your business. The system is an automated tool designed to assist professional barbers and stylists with scheduling and client communication via WhatsApp.</p>
+            </section>
+
+            <section>
+              <h2 className="text-barber-white font-black text-lg mb-3 uppercase tracking-tighter italic">2. 30-Day Free Trial & Subscriptions</h2>
+              <p>New subscribers to the <strong>Full Plan (AI Concierge)</strong> are entitled to a <strong>30-day free trial period</strong>. You may cancel your subscription at any time during this period through your dashboard or Stripe portal without being charged the monthly subscription fee.</p>
+              
+              <div className="bg-barber-red/5 border-l-4 border-barber-red p-4 my-4">
+                <p className="text-barber-white font-bold italic text-xs">
+                  "Note: The Setup/Activation Fee is non-refundable. This fee covers the immediate reservation of your dedicated US (+1) infrastructure and official WhatsApp API channel allocation, which are provided instantly upon registration."
+                </p>
+              </div>
+            </section>
+
+            <section>
+              <h2 className="text-barber-white font-black text-lg mb-3 uppercase tracking-tighter italic">3. Data Responsibility</h2>
+              <p>Schedy AI acts as the Data <strong>Processor</strong>. The Professional (Tenant) is the Data <strong>Controller</strong>, responsible for ensuring that clients are aware that their scheduling intentions are processed via Artificial Intelligence for business efficiency.</p>
+            </section>
+
+            <section>
+              <h2 className="text-barber-white font-black text-lg mb-3 uppercase tracking-tighter italic">4. AI Privacy Policy</h2>
+              <p>We utilize the Google Gemini API to process and understand booking requests. Conversation data is strictly used for real-time scheduling and is NOT used for public AI model training, preserving your commercial secrets and client privacy.</p>
+            </section>
+
+            <div className="pt-10 border-t border-zinc-800 text-center space-y-2">
+              <p className="text-[10px] font-bold uppercase tracking-widest">Last Updated: February 11, 2026</p>
+              <p className="text-[10px] font-black text-barber-gold uppercase tracking-widest italic flex items-center justify-center gap-2">
+                <Zap size={10} fill="currentColor" /> Schedy AI Inc. • US International Division
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </AppLayout>
+  );
+}
+```
+
+
+--- ARQUIVO: src/components/ui/Sidebar.jsx ---
+```javascript
+import React, { useState, useEffect } from 'react';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { 
+  Calendar, 
+  LogOut, 
+  User, 
+  Zap, 
+  ShieldAlert, 
+  FileText, 
+  Briefcase, 
+  Users,
+  MessageSquare,
+  Sparkles,
+  BarChart3,
+  CreditCard,
+  TrendingUp,
+  HelpCircle, // Novo ícone para a Central de Ajuda
+  X 
+} from 'lucide-react';
+import { signOut } from 'firebase/auth';
+import { auth, db } from '../../services/firebase';
+import { getProfessionalProfile } from '../../services/professionalService'; 
+import { getSalespersonProfile } from '../../services/salesService'; 
+import { PWAInstallButton } from './PWAInstallButton';
+
+export function Sidebar({ onClose }) {
+  const location = useLocation(); 
+  const navigate = useNavigate();
+  
+  // ESTADOS DE PERMISSÃO
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [isPro, setIsPro] = useState(false);
+  const [isSales, setIsSales] = useState(false); 
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    async function checkUserStatus() {
+      if (auth.currentUser) {
+        try {
+          const profile = await getProfessionalProfile();
+          
+          if (profile) {
+            if (profile.role === 'admin') setIsAdmin(true);
+            if (profile.plan === 'pro') setIsPro(true);
+            setIsSales(false);
+          } else {
+            const salesProfile = await getSalespersonProfile(auth.currentUser.uid);
+            if (salesProfile) {
+              setIsSales(true);
+            }
+          }
+        } catch (error) {
+          console.error("Error checking user status:", error);
+        } finally {
+          setLoading(false);
+        }
+      }
+    }
+    checkUserStatus();
+  }, [auth.currentUser]);
+
+  // --- CONSTRUÇÃO DINÂMICA DO MENU ---
+  let menuItems = [];
+
+  if (isSales) {
+    // MENU PARA VENDEDORES
+    menuItems = [
+      { path: '/sales-console', icon: TrendingUp, label: 'Sales Console' },
+      { path: '/profile', icon: User, label: 'My Profile' },
+      { path: '/support', icon: HelpCircle, label: 'Help Center' }, // Adicionado
+      { path: '/terms', icon: FileText, label: 'Legal' },
+    ];
+  } else {
+    // MENU PARA BARBEIROS (PROFISSIONAIS)
+    menuItems = [
+      { path: '/dashboard', icon: Calendar, label: 'Schedule' },
+      { path: '/messages', icon: MessageSquare, label: 'Messages' },
+      { path: '/customers', icon: Users, label: 'Customers' },
+      { path: '/services', icon: Briefcase, label: 'Services' },
+      { path: '/profile', icon: User, label: 'Profile' },
+      isPro 
+        ? { path: '/billing', icon: CreditCard, label: 'Billing' }
+        : { path: '/pricing', icon: Zap, label: 'Plans' },
+      { path: '/support', icon: HelpCircle, label: 'Help Center' }, // Adicionado
+      { path: '/terms', icon: FileText, label: 'Legal' },
+    ];
+  }
+
+  // ADICIONA ITENS DE ADMIN (Se aplicável)
+  if (isAdmin) {
+    menuItems.push({ path: '/admin', icon: ShieldAlert, label: 'Management' });
+    menuItems.push({ path: '/admin-dashboard', icon: BarChart3, label: 'BI Analytics' });
+  }
+
+  const handleLogout = async () => {
+    await signOut(auth);
+    navigate('/');
+  };
+
+  return (
+    <aside className="w-64 bg-barber-black border-r border-zinc-800 flex flex-col h-full shadow-2xl">
+      
+      {/* HEADER DA SIDEBAR */}
+      <div className="h-20 flex items-center justify-between px-6 border-b border-zinc-800">
+        <div className="flex items-center gap-2">
+            <Sparkles className="text-barber-gold" size={20} />
+            <h1 className="text-xl font-black text-barber-white tracking-tighter uppercase italic">SCHEDY</h1>
+        </div>
+        
+        <button 
+          onClick={onClose} 
+          className="lg:hidden p-2 text-zinc-500 hover:text-white transition-colors"
+        >
+          <X size={24} />
+        </button>
+      </div>
+
+      {/* NAVEGAÇÃO PRINCIPAL */}
+      <nav className="flex-1 py-6 flex flex-col gap-2 px-3 overflow-y-auto custom-scrollbar">
+        {loading ? (
+          <div className="px-4 py-2 text-[10px] text-zinc-600 font-bold uppercase animate-pulse">Verifying Access...</div>
+        ) : (
+          menuItems.map((item) => {
+            const isActive = location.pathname === item.path;
+            return (
+              <Link
+                key={item.path}
+                to={item.path}
+                onClick={onClose}
+                className={`flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 ${
+                  isActive 
+                    ? 'bg-barber-red text-white shadow-lg shadow-red-900/30 translate-x-1' 
+                    : 'text-barber-gray hover:bg-zinc-800/50 hover:text-white font-medium'
+                }`}
+              >
+                <item.icon size={20} />
+                <span className="font-bold uppercase tracking-tight italic text-sm">{item.label}</span>
+              </Link>
+            );
+          })
+        )}
+      </nav>
+
+      {/* ÁREA INFERIOR */}
+      <div className="p-4 border-t border-zinc-800 flex flex-col gap-4">
+        
+        <PWAInstallButton />
+
+        <button 
+          onClick={handleLogout}
+          className="w-full flex items-center gap-3 px-4 py-3 text-zinc-500 hover:text-red-500 hover:bg-red-500/10 rounded-xl transition-all font-bold uppercase italic text-sm"
+        >
+          <LogOut size={20} />
+          <span>Log Out</span>
+        </button>
+      </div>
+    </aside>
+  );
+}
+```
+
+
+--- ARQUIVO: src/components/ui/AppLayout.jsx ---
+```javascript
+import React, { useState } from 'react';
+import { Sidebar } from './Sidebar';
+import { Menu, X } from 'lucide-react';
+import { SupportChat } from './SupportChat'; // Importamos o novo chat
+
+export function AppLayout({ children }) {
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+
+  return (
+    <div className="min-h-screen bg-barber-dark text-barber-white flex">
+      {/* Overlay para fechar o menu ao clicar fora (Mobile) */}
+      {isSidebarOpen && (
+        <div 
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-40 lg:hidden"
+          onClick={() => setIsSidebarOpen(false)}
+        />
+      )}
+
+      {/* Sidebar */}
+      <div className={`
+        fixed inset-y-0 left-0 z-50 transform transition-transform duration-300 ease-in-out
+        lg:relative lg:translate-x-0
+        ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
+      `}>
+        <Sidebar onClose={() => setIsSidebarOpen(false)} />
+      </div>
+      
+      {/* Conteúdo Principal */}
+      <main className="flex-1 w-full min-w-0 flex flex-col h-screen overflow-hidden">
+        {/* Header Mobile */}
+        <div className="lg:hidden flex items-center justify-between p-4 border-b border-zinc-800 bg-barber-black/50 backdrop-blur-md">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 bg-barber-gold rounded-lg flex items-center justify-center text-black font-black italic text-xs">SC</div>
+            <span className="font-black uppercase tracking-tighter italic text-sm">Schedy</span>
+          </div>
+          <button 
+            onClick={() => setIsSidebarOpen(true)}
+            className="p-2 text-barber-gold hover:bg-zinc-800 rounded-lg transition-colors"
+          >
+            <Menu size={24} />
+          </button>
+        </div>
+
+        {/* Área do Conteúdo com Scroll Independente */}
+        <div className="flex-1 overflow-y-auto p-3 md:p-8 custom-scrollbar">
+          <div className="max-w-7xl mx-auto">
+            {children}
+          </div>
+        </div>
+      </main>
+
+      {/* AGENTE DE IA GLOBAL (Aparece em todas as páginas) */}
+      <SupportChat />
+    </div>
+  );
+}
+```
+
+
+--- ARQUIVO: src/components/ui/Modal.jsx ---
+```javascript
+import React, { useEffect } from 'react';
+import { X } from 'lucide-react';
+
+export function Modal({ isOpen, onClose, title, children }) {
+  
+  // BLOQUEIO DE SCROLL DO FUNDO:
+  // Impede que a tela de trás (calendário) se mova enquanto o modal está aberto.
+  useEffect(() => {
+    if (isOpen) {
+      document.body.style.overflow = 'hidden';
+    } else {
+      document.body.style.overflow = 'unset';
+    }
+    
+    // Limpeza ao fechar ou desmontar o componente
+    return () => {
+      document.body.style.overflow = 'unset';
+    };
+  }, [isOpen]);
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+      
+      {/* Fundo escuro (clicar nele fecha o modal) */}
+      <div 
+        className="absolute inset-0 bg-black/90 backdrop-blur-sm transition-opacity"
+        onClick={onClose}
+      ></div>
+
+      {/* A Janela do Modal - Agora com altura máxima e flexbox para permitir scroll interno */}
+      <div className="relative w-full max-w-md bg-barber-black border border-zinc-800 rounded-2xl shadow-2xl flex flex-col max-h-[90vh] animate-in fade-in zoom-in duration-200">
+        
+        {/* Cabeçalho Fixo no Topo */}
+        <div className="flex items-center justify-between p-6 border-b border-zinc-800/50">
+          <h2 className="text-xl font-black text-barber-white uppercase italic tracking-tighter">{title}</h2>
+          <button 
+            onClick={onClose}
+            className="text-barber-gray hover:text-white transition-colors p-1.5 bg-zinc-900 rounded-lg"
+          >
+            <X size={20} />
+          </button>
+        </div>
+
+        {/* Área de Conteúdo (Formulário) - Onde o scroll acontece */}
+        <div className="flex-1 overflow-y-auto p-6 custom-scrollbar">
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+
+--- ARQUIVO: src/components/ui/Button.jsx ---
+```javascript
+import React from 'react';
+
+// Este componente aceita:
+// - children: o texto dentro do botão
+// - variant: 'primary' (vermelho) ou 'outline' (borda dourada)
+// - loading: se for true, mostra "Carregando..." e desabilita
+// - ...props: qualquer outra coisa (como onClick)
+export function Button({ children, variant = 'primary', loading, className = '', ...props }) {
+  
+  const baseStyles = "w-full py-3 px-4 rounded font-bold transition-all duration-200 flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed";
+  
+  const variants = {
+    primary: "bg-barber-red hover:bg-red-700 text-white shadow-lg shadow-red-900/20",
+    outline: "border border-barber-gold text-barber-gold hover:bg-barber-gold hover:text-barber-black",
+    ghost: "text-barber-gray hover:text-white"
+  };
+
+  return (
+    <button 
+      disabled={loading}
+      className={`${baseStyles} ${variants[variant]} ${className}`}
+      {...props}
+    >
+      {loading ? (
+        <span className="animate-pulse">Processando...</span>
+      ) : children}
+    </button>
+  );
+}
+```
+
+
+--- ARQUIVO: src/components/ui/Input.jsx ---
+```javascript
+import React from 'react';
+
+// Este componente já vem com o Label (o título acima do campo)
+export function Input({ label, type = "text", error, ...props }) {
+  return (
+    <div className="flex flex-col gap-1 w-full">
+      {label && <label className="text-sm text-barber-gray font-medium">{label}</label>}
+      <input 
+        type={type}
+        className={`bg-barber-black border border-zinc-800 rounded p-3 text-barber-white focus:outline-none focus:border-barber-gold transition-colors placeholder:text-zinc-700 ${error ? 'border-red-500' : ''}`}
+        {...props}
+      />
+      {error && <span className="text-xs text-red-500">{error}</span>}
+    </div>
+  );
+}
+```
+
+
+--- ARQUIVO: src/components/calendar/DayView.jsx ---
+```javascript
+import React, { useState, useEffect, useRef } from 'react';
+import { DndContext, useSensor, useSensors, PointerSensor } from '@dnd-kit/core';
+import { 
+  hoursArray, 
+  getNewStartTime, 
+  START_HOUR, 
+  getNowPosition, 
+  getPositionFromTime 
+} from '../../utils/timeGrid'; 
+import { AppointmentCard } from './AppointmentCard';
+import { addDays, format, isSameDay, setHours, setMinutes } from 'date-fns';
+
+export function DayView({ 
+  appointments, 
+  onAppointmentMove, 
+  onAppointmentClick, 
+  onTimeSlotClick, 
+  onComplete, 
+  onDelete,   
+  startDate = new Date(), 
+  businessHours,
+  timezone = "America/New_York"
+}) {
+  const scrollContainerRef = useRef(null);
+  const [numDays, setNumDays] = useState(1);
+  const [nowPos, setNowPos] = useState(0);
+  const [currentTimeStr, setCurrentTimeStr] = useState(""); 
+  const [pxPerHour, setPxPerHour] = useState(90);
+  const [containerHeight, setContainerHeight] = useState(0);
+
+  // 1. Ajuste de Responsividade e Escala
+  useEffect(() => {
+    const updateLayout = () => {
+      setNumDays(window.innerWidth >= 768 ? 3 : 1);
+      if (scrollContainerRef.current) {
+        const height = scrollContainerRef.current.offsetHeight;
+        setContainerHeight(height);
+        setPxPerHour(height / 10); 
+      }
+    };
+
+    updateLayout();
+    window.addEventListener('resize', updateLayout);
+    return () => window.removeEventListener('resize', updateLayout);
+  }, []);
+
+  // 2. Lógica da "Agulha Fixa" + Relógio Digital + Auto-Scroll
+  useEffect(() => {
+    const updateNowAndScroll = () => {
+      const now = new Date();
+      
+      const pos = getNowPosition(timezone, pxPerHour);
+      setNowPos(pos);
+
+      const timeStr = new Intl.DateTimeFormat('pt-BR', {
+        timeZone: timezone,
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+      }).format(now);
+      setCurrentTimeStr(timeStr);
+      
+      const todayInTimezone = new Date(now.toLocaleString("en-US", {timeZone: timezone}));
+      const isViewingToday = isSameDay(startDate, todayInTimezone);
+      
+      if (isViewingToday && scrollContainerRef.current) {
+        const targetScroll = pos - (containerHeight * 0.3);
+        
+        scrollContainerRef.current.scrollTo({
+          top: targetScroll,
+          behavior: 'smooth'
+        });
+      }
+    };
+
+    updateNowAndScroll();
+    const interval = setInterval(updateNowAndScroll, 10000); 
+    return () => clearInterval(interval);
+  }, [pxPerHour, containerHeight, timezone, startDate]);
+
+  const days = Array.from({ length: numDays }, (_, i) => addDays(startDate, i));
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
+
+  const handleDragEnd = (event) => {
+    const { active, delta } = event;
+    if (!delta.y) return;
+    const appointment = active.data.current;
+    const newStartTime = getNewStartTime(appointment.startTime, delta.y, pxPerHour);
+    if (onAppointmentMove) onAppointmentMove(appointment.id, newStartTime);
+  };
+
+  const handleGridClick = (e, dayDate) => {
+    if (e.target.closest('[data-appointment-card]')) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const offsetY = e.clientY - rect.top + e.currentTarget.scrollTop; 
+    const hoursPassed = offsetY / pxPerHour;
+    const hour = Math.floor(hoursPassed) + START_HOUR;
+    const minutes = Math.floor((hoursPassed % 1) * 60);
+    const roundedMinutes = Math.round(minutes / 15) * 15;
+    
+    let clickedDate = setHours(dayDate, hour);
+    clickedDate = setMinutes(clickedDate, roundedMinutes);
+    clickedDate.setSeconds(0);
+    clickedDate.setMilliseconds(0);
+    if (onTimeSlotClick) onTimeSlotClick(clickedDate);
+  };
+
+  const getTop = (timeStr) => {
+    if (!timeStr || timeStr === "none") return 0;
+    return getPositionFromTime(`2000-01-01T${timeStr}:00`, pxPerHour);
+  };
+
+  return (
+    <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+      <div className="w-full bg-barber-black border border-zinc-800 rounded-xl overflow-hidden flex flex-col h-full shadow-2xl relative border-t-barber-gold/20">
+        
+        <div className="bg-zinc-900/95 backdrop-blur-xl border-b border-zinc-800 flex divide-x divide-zinc-800 z-30">
+           <div className="w-16 flex-shrink-0 bg-zinc-900/50"></div>
+           {days.map((day, index) => (
+             <div key={index} className="flex-1 p-3 text-center">
+               <span className="block text-[10px] text-zinc-500 uppercase font-black tracking-widest">{format(day, 'EEEE')}</span>
+               <span className={`block font-black text-lg ${isSameDay(day, new Date()) ? 'text-barber-gold' : 'text-white'}`}>
+                 {format(day, 'MMM dd')}
+               </span>
+             </div>
+           ))}
+        </div>
+
+        <div 
+          ref={scrollContainerRef}
+          className="flex-1 overflow-y-auto relative custom-scrollbar select-none"
+          style={{ scrollBehavior: 'smooth' }}
+        >
+          <div className="flex relative" style={{ height: hoursArray.length * pxPerHour }}>
+            
+            {/* Linha de Tempo (Agulha) */}
+            <div 
+              className="absolute left-0 w-full z-20 pointer-events-none flex items-center transition-all duration-1000 ease-linear"
+              style={{ top: nowPos }}
+            >
+              <div className="w-16 flex justify-end pr-2">
+                <div className="bg-barber-gold text-black text-[11px] font-extrabold px-2 py-0.5 rounded shadow-[0_0_15px_rgba(197,160,89,0.5)] flex items-center gap-1.5 min-w-[58px] justify-center">
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-black opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-black"></span>
+                  </span>
+                  {currentTimeStr}
+                </div>
+              </div>
+              <div className="flex-1 border-t-2 border-barber-gold shadow-[0_0_20px_rgba(197,160,89,0.4)]"></div>
+            </div>
+
+            {/* Coluna de Horas (Lateral) */}
+            <div className="w-16 flex-shrink-0 bg-zinc-900/40 border-r border-zinc-800 relative z-10 pointer-events-none">
+              {hoursArray.map((hour) => (
+                <div 
+                  key={hour} 
+                  className="absolute w-full text-right pr-3 text-[10px] font-black text-zinc-600 -mt-2.5" 
+                  style={{ top: (hour - START_HOUR) * pxPerHour }}
+                >
+                  {hour.toString().padStart(2, '0')}:00
+                </div>
+              ))}
+            </div>
+
+            {/* Colunas de Dias */}
+            {days.map((day, colIndex) => {
+              const dayAppointments = appointments.filter(apt => isSameDay(new Date(apt.startTime), day));
+
+              return (
+                <div 
+                  key={colIndex} 
+                  className="flex-1 relative border-r border-zinc-800/50 last:border-r-0 cursor-cell hover:bg-white/[0.02] transition-colors" 
+                  onClick={(e) => handleGridClick(e, day)}
+                >
+                  {/* Faixas de Horário Comercial (Abertura/Fechamento) */}
+                  {businessHours && (
+                    <>
+                      <div className="absolute w-full bg-black/50 z-0 pointer-events-none" style={{ top: 0, height: getTop(businessHours.open) }} />
+                      <div className="absolute w-full bg-black/50 z-0 pointer-events-none" style={{ top: getTop(businessHours.close), bottom: 0 }} />
+                      
+                      {/* LÓGICA DO BREAK (PAUSA) */}
+                      {businessHours.break && businessHours.break !== "none" && (
+                        (() => {
+                          const [bStart, bEnd] = businessHours.break.split('-');
+                          const bTop = getTop(bStart);
+                          const bBottom = getTop(bEnd);
+                          return (
+                            <div
+                              className="absolute w-full bg-zinc-800/40 z-0 pointer-events-none flex items-center justify-center border-y border-zinc-700/20"
+                              style={{ top: bTop, height: bBottom - bTop }}
+                            >
+                              <span className="text-[9px] font-black uppercase tracking-[0.3em] text-zinc-600 italic">Pause / Break</span>
+                            </div>
+                          );
+                        })()
+                      )}
+                    </>
+                  )}
+
+                  {/* Linhas Horizontais do Grid */}
+                  {hoursArray.map((hour) => (
+                    <div 
+                      key={hour} 
+                      className="absolute w-full border-b border-zinc-800/40 pointer-events-none" 
+                      style={{ top: (hour - START_HOUR) * pxPerHour, height: pxPerHour }} 
+                    />
+                  ))}
+
+                  {/* Renderização dos Cards de Agendamento */}
+                  {dayAppointments.map((apt) => (
+                    <div key={apt.id} data-appointment-card>
+                        <AppointmentCard 
+                          appointment={apt} 
+                          customPxPerHour={pxPerHour}
+                          onComplete={onComplete} 
+                          onDelete={onDelete}     
+                          onClick={(e) => { 
+                            e.stopPropagation(); 
+                            if (onAppointmentClick) onAppointmentClick(apt); 
+                          }} 
+                        />
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        
+        <div className="bg-barber-black p-2 text-center border-t border-zinc-800 z-30">
+            <p className="text-[9px] text-barber-gold font-black uppercase tracking-[0.3em] animate-pulse">
+              System Live • Polling Active (10s) • {timezone}
+            </p>
+        </div>
+      </div>
+    </DndContext>
+  );
+}
+```
+
+
+--- ARQUIVO: src/components/calendar/AppointmentCard.jsx ---
+```javascript
+import React from 'react';
+import { useDraggable } from '@dnd-kit/core';
+import { CSS } from '@dnd-kit/utilities';
+import { AlertCircle, Lock } from 'lucide-react'; 
+import { 
+  getPositionFromTime, 
+  getHeightFromDuration, 
+  getNewStartTime,    
+  formatTimeDisplay   
+} from '../../utils/timeGrid';
+
+export function AppointmentCard({ appointment, onClick, style: propStyle, customPxPerHour }) {
+  
+  const top = getPositionFromTime(appointment.startTime, customPxPerHour);
+  const height = getHeightFromDuration(appointment.duration, customPxPerHour);
+  const isCompleted = appointment.status === 'completed';
+  const isBlocked = appointment.type === 'block'; 
+  
+  // Verifica se existem notas/observações para ativar o alerta
+  const hasNotes = appointment.notes && appointment.notes.trim().length > 0;
+
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+    id: appointment.id,
+    data: appointment,
+    disabled: isCompleted 
+  });
+
+  let displayTime = formatTimeDisplay(appointment.startTime);
+  
+  if (isDragging && transform) {
+    const projectedTimeISO = getNewStartTime(appointment.startTime, transform.y, customPxPerHour);
+    displayTime = formatTimeDisplay(projectedTimeISO);
+  }
+
+  const showDetails = height >= 35;
+
+  const style = {
+    top: `${top}px`,
+    height: `${height}px`,
+    zIndex: isDragging ? 100 : 10, 
+    transform: CSS.Translate.toString(transform),
+    opacity: isDragging ? 0.9 : (isCompleted ? 0.6 : 1), 
+    position: 'absolute',
+    left: '4px',  
+    right: '4px', 
+    touchAction: 'none',
+    ...propStyle 
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      // hover:z-[50] garante que o card focado fique visualmente acima dos outros
+      className="group hover:z-[50] transition-all duration-75"
+    >
+      {/* 
+          BARRA FLUTUANTE REMOVIDA 
+          A edição agora é feita exclusivamente clicando no card abaixo.
+      */}
+
+      {/* CARD PRINCIPAL - CLICÁVEL PARA ABRIR O MODAL */}
+      <div
+        {...listeners}
+        {...attributes}
+        onClick={(e) => {
+          // IMPORTANTE: Passamos o evento 'e' para o onClick original do DayView
+          if (onClick) onClick(e);
+        }}
+        className={`
+          w-full h-full rounded-lg border-l-4 transition-all duration-200 overflow-hidden relative
+          ${isDragging 
+            ? 'bg-barber-gold text-barber-black border-barber-white shadow-2xl scale-[1.02] cursor-grabbing'
+            : isCompleted
+              ? 'bg-zinc-900 border-zinc-700 cursor-default'
+              : isBlocked
+                ? 'bg-zinc-900/80 border-zinc-500 hover:bg-zinc-800 cursor-pointer' 
+                : hasNotes 
+                  ? 'bg-zinc-800 border-barber-gold animate-pulse-gold shadow-[0_0_15px_rgba(197,160,89,0.3)]' 
+                  : 'bg-zinc-800/90 border-barber-red hover:bg-zinc-700 cursor-pointer shadow-md'
+          }
+        `}
+      >
+        {/* pointer-events-none garante que o clique seja detectado pelo container pai */}
+        <div className="flex justify-between items-center p-2 relative h-full w-full pointer-events-none">
+          {/* Badge Visual de Notas */}
+          {hasNotes && !isCompleted && !isDragging && (
+            <div className="absolute top-1 right-1 text-barber-gold">
+              <AlertCircle size={10} fill="currentColor" className="text-black" />
+            </div>
+          )}
+
+          <div className={`flex flex-col justify-center min-w-0 ${isDragging ? 'opacity-20' : ''}`}>
+            <h4 className={`font-bold text-sm leading-tight truncate flex items-center gap-1.5 ${isCompleted ? 'text-zinc-500 line-through' : 'text-barber-white'}`}>
+              {isBlocked && <Lock size={12} className="text-zinc-500" />}
+              {appointment.clientName}
+            </h4>
+            {showDetails && (
+              <p className={`text-[10px] mt-0.5 truncate ${isCompleted ? 'text-zinc-600' : 'text-barber-gray'}`}>
+                {appointment.serviceName}
+              </p>
+            )}
+          </div>
+
+          <div className={`flex flex-col items-end flex-shrink-0 ml-2 ${isDragging ? 'opacity-20' : ''}`}>
+            {showDetails && !isCompleted && !isBlocked && (
+              <span className={`text-[9px] font-black px-1.5 py-0.5 rounded ${hasNotes ? 'bg-barber-gold text-black' : 'bg-barber-black/50 text-barber-gold'}`}>
+                ${appointment.price}
+              </span>
+            )}
+            {!isDragging && (
+              <span className={`text-[10px] mt-1 ${isCompleted ? 'text-zinc-600' : 'text-barber-white font-bold'}`}>
+                {displayTime}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
