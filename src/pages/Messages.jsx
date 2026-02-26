@@ -13,9 +13,7 @@ import {
   Headphones
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
-import { listenToChats } from '../services/professionalService';
-import { db } from '../services/firebase';
-import { doc, updateDoc } from 'firebase/firestore';
+import { listenToChats, resumeAiForClient } from '../services/professionalService';
 import { useAuth } from '../contexts/AuthContext';
 
 export function Messages() {
@@ -32,10 +30,13 @@ export function Messages() {
       setChats(data);
       setLoading(false);
       
-      // Sincroniza o chat selecionado se ele sofrer alterações no banco
+      // Sincroniza o chat selecionado se ele sofrer alterações no banco (novas mensagens ou status)
       if (selectedChat) {
         const updatedSelected = data.find(c => c.id === selectedChat.id);
         if (updatedSelected && updatedSelected.history?.length !== selectedChat.history?.length) {
+            setSelectedChat(updatedSelected);
+        } else if (updatedSelected && updatedSelected.status !== selectedChat.status) {
+            // Atualiza se o status (pausa/ativo) mudar
             setSelectedChat(updatedSelected);
         }
       }
@@ -51,27 +52,25 @@ export function Messages() {
     }
   }, [selectedChat?.history?.length, selectedChat?.id]);
 
-  // 3. FUNÇÃO PARA RETOMAR IA (HITL) - PRESERVADA
-  const handleResumeAI = async (chatId) => {
+  // 3. FUNÇÃO PARA RETOMAR IA (HITL) - ATUALIZADA PARA USAR O SERVIÇO ROBUSTO
+  const handleReactivateAi = async () => {
+    if (!selectedChat) return;
     try {
-      const chatRef = doc(db, 'barbers', profile.id, 'chats', chatId);
-      await updateDoc(chatRef, { 
-        status: 'active', 
-        needsAttention: false,
-        updatedAt: new Date().toISOString()
-      });
+      // Chama a função que limpa o status no Mapeamento Global e no Chat Local
+      await resumeAiForClient(selectedChat.id);
     } catch (error) {
       console.error("Error resuming AI:", error);
+      alert("Falha ao reativar a IA. Tente novamente.");
     }
   };
 
-  // 4. FILTRAGEM - PRESERVADA
+  // 4. FILTRAGEM DE CONVERSAS
   const filteredChats = chats.filter(c => 
     (c.clientName || "").toLowerCase().includes(searchTerm.toLowerCase()) ||
     c.id.includes(searchTerm)
   );
 
-  // 5. AUXILIAR DE VOZ COM PROTEÇÃO DE TIPO - MELHORADA
+  // 5. AUXILIAR DE VOZ COM PROTEÇÃO DE TIPO
   const isVoiceMessage = (text) => {
     if (typeof text !== 'string') return false;
     return text.includes("[PHONE CALL]") || text.includes("[PHONE CALL CONTEXT]");
@@ -107,7 +106,6 @@ export function Messages() {
               <p className="text-center text-zinc-600 text-[10px] mt-10 font-black uppercase tracking-widest italic">No chats found.</p>
             ) : (
               filteredChats.map((chat) => {
-                // BLINDAGEM CONTRA UNDEFINED NA LISTA
                 const lastMsgText = chat.history?.[chat.history.length - 1]?.parts?.[0]?.text || "";
                 const isPaused = chat.status === 'paused';
                 
@@ -133,7 +131,7 @@ export function Messages() {
                       <div className="flex items-center gap-1.5 min-w-0">
                         {isVoiceMessage(lastMsgText) && <Phone size={10} className="text-barber-gold shrink-0" />}
                         <p className="text-[10px] text-zinc-500 truncate font-medium italic">
-                            {lastMsgText.replace(/\[PHONE CALL CONTEXT\]:|\[PHONE CALL\]:/g, '') || 'Starting...'}
+                            {lastMsgText.replace(/\[PHONE CALL CONTEXT\]:|\[PHONE CALL\]:|\[PAUSE_AI\]/g, '') || 'Starting...'}
                         </p>
                       </div>
                     </div>
@@ -151,7 +149,7 @@ export function Messages() {
         <div className={`flex-1 flex flex-col bg-zinc-950 relative ${!selectedChat ? 'hidden md:flex' : 'flex'}`}>
           {selectedChat ? (
             <>
-              {/* Header do Chat - PRESERVADO */}
+              {/* Header do Chat */}
               <div className="p-4 bg-zinc-900/90 backdrop-blur-md border-b border-zinc-800 flex items-center justify-between shadow-lg z-20">
                 <div className="flex items-center gap-3">
                    <button onClick={() => setSelectedChat(null)} className="md:hidden p-2 text-zinc-400 hover:text-white">←</button>
@@ -179,8 +177,8 @@ export function Messages() {
                 <div className="flex items-center gap-2">
                     {selectedChat.status === 'paused' && (
                         <button 
-                            onClick={() => handleResumeAI(selectedChat.id)}
-                            className="flex items-center gap-2 bg-barber-gold text-black px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-105 transition-all"
+                            onClick={handleReactivateAi}
+                            className="flex items-center gap-2 bg-barber-gold text-black px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-105 transition-all shadow-lg shadow-barber-gold/10"
                         >
                             <Play size={12} fill="currentColor" /> Resume AI
                         </button>
@@ -195,20 +193,21 @@ export function Messages() {
                 </div>
               </div>
 
-              {/* Alerta de Pausa - PRESERVADO */}
+              {/* Barra de Alerta de Intervenção Humana */}
               {selectedChat.status === 'paused' && (
                   <div className="bg-red-500/10 border-b border-red-500/20 px-6 py-2 flex items-center gap-2 text-red-400 animate-in slide-in-from-top duration-300">
                       <AlertCircle size={14} />
-                      <span className="text-[10px] font-black uppercase tracking-widest italic">Intervention Required: AI Concierge is offline for this chat.</span>
+                      <span className="text-[10px] font-black uppercase tracking-widest italic">Action Required: AI Concierge is paused. This client needs manual attention.</span>
                   </div>
               )}
 
-              {/* Área de Mensagens - BLINDADA CONTRA ERRO DE REPLACE */}
+              {/* Área de Mensagens */}
               <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar bg-[url('https://www.transparenttextures.com/patterns/carbon-fibre.png')]">
                 {selectedChat.history?.map((msg, idx) => {
-                  const rawText = msg.parts?.[0]?.text || ""; // Fallback para string vazia
+                  const rawText = msg.parts?.[0]?.text || "";
                   const isVoice = isVoiceMessage(rawText);
-                  const cleanText = rawText.replace(/\[PHONE CALL CONTEXT\]:|\[PHONE CALL\]:/g, '').trim();
+                  // Limpa tags técnicas da visualização
+                  const cleanText = rawText.replace(/\[PHONE CALL CONTEXT\]:|\[PHONE CALL\]:|\[PAUSE_AI\]/g, '').trim();
 
                   return (
                     <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in zoom-in duration-300`}>
@@ -235,7 +234,7 @@ export function Messages() {
                 <div ref={messagesEndRef} className="h-4" />
               </div>
 
-              {/* Footer de Status - PRESERVADO */}
+              {/* Footer de Status */}
               <div className="p-3 bg-zinc-900 border-t border-zinc-800 flex items-center justify-center gap-4">
                   <div className="flex items-center gap-1.5">
                     <div className={`w-1.5 h-1.5 rounded-full ${selectedChat.status === 'paused' ? 'bg-red-500' : 'bg-green-500 animate-pulse'}`}></div>

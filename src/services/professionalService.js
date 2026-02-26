@@ -1,4 +1,8 @@
-// Importamos as instâncias JÁ INICIALIZADAS do firebase.js
+/**
+ * src/services/professionalService.js
+ * Camada de Serviço para Profissionais (Tenants) - Schedy AI
+ */
+
 import { db, auth, functions } from './firebase'; 
 import { 
   collection, 
@@ -14,10 +18,10 @@ import {
   onSnapshot 
 } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
-// Importamos utilitários de data para a lógica de bloqueio recorrente
 import { addDays, addWeeks, addMonths, parseISO, formatISO } from 'date-fns';
 
 const BARBERS_COLLECTION = 'barbers';
+const CUSTOMER_MAPPINGS = 'customer_mappings';
 
 // ==========================================
 // SERVIÇOS (Catálogo de Preços e Duração)
@@ -64,9 +68,6 @@ export const addAppointment = async (appointmentData) => {
   return { id: docRef.id, ...appointmentData };
 };
 
-/**
- * BLOQUEAR AGENDA (Com suporte a recorrência)
- */
 export const addBlockedTime = async (blockData) => {
   if (!auth.currentUser) throw new Error("User not logged in");
   const { startTime, duration, notes, recurrence, occurrences } = blockData;
@@ -147,7 +148,7 @@ export const deleteCustomer = async (customerId) => {
 };
 
 // ==========================================
-// MENSAGENS (Live Chat - Real-time)
+// MENSAGENS E HITL (Human-in-the-Loop)
 // ==========================================
 export const listenToChats = (callback) => {
   if (!auth.currentUser) return;
@@ -166,8 +167,40 @@ export const listenToSingleChat = (chatId, callback) => {
   if (!auth.currentUser) return;
   const chatRef = doc(db, BARBERS_COLLECTION, auth.currentUser.uid, 'chats', chatId);
   return onSnapshot(chatRef, (doc) => {
-    if (doc.exists()) callback(doc.data());
+    if (doc.exists()) callback({ id: doc.id, ...doc.data() });
   });
+};
+
+/**
+ * REATIVAR IA PARA UM CLIENTE ESPECÍFICO
+ * Remove a trava de segurança (status: paused) e devolve o controle ao Gemini.
+ */
+export const resumeAiForClient = async (customerPhone) => {
+  if (!auth.currentUser) throw new Error("User not logged in");
+  const barberId = auth.currentUser.uid;
+  const nowISO = new Date().toISOString();
+
+  try {
+    // 1. Atualiza o Mapeamento Global (Libera o Webhook)
+    const mappingRef = doc(db, CUSTOMER_MAPPINGS, customerPhone);
+    await updateDoc(mappingRef, {
+      [`tenants.${barberId}.status`]: 'active',
+      [`tenants.${barberId}.lastInteraction`]: nowISO
+    });
+
+    // 2. Atualiza o Chat Local (Remove alerta visual no Dashboard)
+    const chatRef = doc(db, BARBERS_COLLECTION, barberId, 'chats', customerPhone);
+    await updateDoc(chatRef, {
+      status: 'active',
+      needsAttention: false,
+      updatedAt: nowISO
+    });
+
+    return true;
+  } catch (error) {
+    console.error("Error resuming AI:", error);
+    throw error;
+  }
 };
 
 // ==========================================
@@ -183,38 +216,30 @@ export const getProfessionalProfile = async () => {
 export const updateProfessionalProfile = async (profileData) => {
   if (!auth.currentUser) throw new Error("User not logged in");
   const docRef = doc(db, BARBERS_COLLECTION, auth.currentUser.uid);
-  await setDoc(docRef, profileData, { merge: true });
+  await setDoc(docRef, { ...profileData, updatedAt: new Date().toISOString() }, { merge: true });
 };
 
 // ==========================================
-// FATURAMENTO E PORTAL STRIPE (BILLING)
+// FATURAMENTO E ATIVAÇÃO
 // ==========================================
-
-/**
- * Gera uma sessão para o Stripe Customer Portal.
- * Permite gerenciar métodos de pagamento e assinaturas.
- */
 export const createStripePortalSession = async () => {
   if (!auth.currentUser) throw new Error("Login required");
   try {
     const portalFn = httpsCallable(functions, 'createStripePortalSession');
     const result = await portalFn({});
-    return result.data; // Retorna { url: '...' }
+    return result.data;
   } catch (error) {
     console.error("Stripe Portal Error:", error);
     throw error;
   }
 };
 
-// ==========================================
-// ATIVAÇÃO DO CONCIERGE (PRO PLAN)
-// ==========================================
-export const provisionConciergeNumber = async () => {
+export const provisionConciergeNumber = async (data = { areaCode: 'random' }) => {
   if (!auth.currentUser) throw new Error("Login required");
   try {
     await auth.currentUser.getIdToken(true);
     const provisionNumberFn = httpsCallable(functions, 'provisionNumber');
-    const result = await provisionNumberFn({});
+    const result = await provisionNumberFn(data);
     return result.data;
   } catch (error) {
     console.error("Schedy Activation Error:", error);
