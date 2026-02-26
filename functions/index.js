@@ -7,7 +7,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 // 1. IMPORTAÇÕES DE CONFIGURAÇÃO
 const { REGION, CONCIERGE_NUMBER } = require("./config");
 
-// 2. CONFIGURAÇÃO DE APIS (Lendo estritamente do .env)
+// 2. CONFIGURAÇÃO DE APIS (Lendo do .env)
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
@@ -18,14 +18,16 @@ admin.initializeApp();
 setGlobalOptions({ region: REGION });
 
 /**
- * WEBHOOK DO WHATSAPP (Preservado)
+ * WEBHOOK DO WHATSAPP
+ * Recebe mensagens e encaminha para o processador de mensagens.
  */
 exports.whatsappWebhook = onRequest(async (req, res) => {
   return handleIncomingMessage(req, res);
 });
 
 /**
- * WEBHOOK DO STRIPE (Preservado com Lógica de Comissões)
+ * WEBHOOK DO STRIPE
+ * Gerencia a ativação do plano PRO e o pagamento de comissões para parceiros.
  */
 exports.stripeWebhook = onRequest(async (req, res) => {
   const event = req.body;
@@ -96,7 +98,7 @@ exports.stripeWebhook = onRequest(async (req, res) => {
 });
 
 /**
- * CRON JOB: VERIFICAÇÃO DE EXPIRAÇÃO DE TRIAL (Preservado)
+ * CRON JOB: VERIFICAÇÃO DE EXPIRAÇÃO DE TRIAL
  */
 exports.checkTrialExpiration = onSchedule({
   schedule: "0 9 * * *",
@@ -130,25 +132,40 @@ exports.checkTrialExpiration = onSchedule({
 });
 
 /**
- * PROVISIONAMENTO DE NÚMERO (Preservado)
+ * PROVISIONAMENTO DE NÚMERO (PIVOT: US ONLY)
+ * Alterado para forçar apenas o uso de números dos EUA (+1).
  */
 exports.provisionNumber = onCall(async (request) => {
   if (!request.auth) throw new HttpsError('unauthenticated', 'Login required');
+  
+  // A estratégia agora é apenas 'US'. Ignoramos solicitações para outros países.
   const areaCode = request.data?.areaCode || 'random';
+  
   try {
-    await admin.firestore().collection('barbers').doc(request.auth.uid).update({
+    const updatePayload = {
       phone: CONCIERGE_NUMBER.replace('+', ''),
-      numberCountry: 'US', 
+      numberCountry: 'US', // Hardcoded: Estratégia de Concierge Internacional
       numberType: 'international_concierge',
       selectedAreaCode: areaCode,
-      numberActivatedAt: new Date().toISOString()
-    });
-    return { success: true, phoneNumber: CONCIERGE_NUMBER };
-  } catch (error) { throw new HttpsError('internal', error.message); }
+      numberActivatedAt: new Date().toISOString(),
+      status: 'active'
+    };
+
+    await admin.firestore().collection('barbers').doc(request.auth.uid).update(updatePayload);
+    
+    return { 
+      success: true, 
+      phoneNumber: CONCIERGE_NUMBER,
+      country: 'US'
+    };
+  } catch (error) { 
+    console.error("Erro no provisionamento US:", error);
+    throw new HttpsError('internal', error.message); 
+  }
 });
 
 /**
- * GERA LINK DO PORTAL DO CLIENTE (Preservado)
+ * GERA LINK DO PORTAL DO CLIENTE STRIPE
  */
 exports.createPortalSession = onCall(async (request) => {
   if (!request.auth) throw new HttpsError('unauthenticated', 'Login required');
@@ -165,36 +182,36 @@ exports.createPortalSession = onCall(async (request) => {
 });
 
 /**
- * AGENTE DE IA DE SUPORTE (ATUALIZADO: MODELO 100% DINÂMICO)
+ * AGENTE DE IA DE SUPORTE (PIVOT: REGRAS ANTI-ALUCINAÇÃO)
+ * Atualizado com instruções de integridade de dados e âncoras técnicas.
  */
 exports.supportChat = onCall(async (request) => {
   const { message, history } = request.data;
   
   if (!message) throw new HttpsError('invalid-argument', 'Message is required');
 
-  // BUSCA O MODELO NO .ENV (VERDADE ABSOLUTA)
   const selectedModel = process.env.GEMINI_MODEL;
-
-  // Se a variável não estiver no .env, o sistema para aqui e avisa no log
   if (!selectedModel) {
-    console.error("ERRO CRÍTICO: Variável GEMINI_MODEL não definida no arquivo .env");
     throw new HttpsError('failed-precondition', 'AI Model configuration is missing on server.');
   }
 
   try {
     const model = genAI.getGenerativeModel({ 
       model: selectedModel,
-      systemInstruction: `You are the Schedy AI Support Agent. Your goal is to help Professionals (Barbers/Stylists) and Sales Partners.
+      systemInstruction: `Você é o Schedy AI Support Agent. Você ajuda profissionais a configurar sua IA de agendamento.
       
-      CORE KNOWLEDGE:
-      - Product: AI Concierge that automates WhatsApp bookings 24/7.
-      - Pricing: $29/month for Global/US, R$97/month for Brazil.
-      - Trial: 30-day Free Trial for new Pro users.
-      - Phone Strategy: We use US (+1) numbers for INSTANT activation.
-      - Partner Program: Partners earn 20% recurring commission.
-      - Payouts: Minimum withdrawal is $10.00.
+      REGRAS DE INTEGRIDADE:
+      1. ÂNCORAS DE DATA: Sempre utilize o formato ISO-8601 (YYYY-MM-DD) para processar datas. Hoje é ${new Date().toISOString().split('T')[0]}.
+      2. VERDADE DE DADOS: Priorize informações técnicas sobre o sistema em vez do histórico da conversa.
+      3. ESTRATÉGIA DE TELEFONE: Informe claramente que oferecemos APENAS números dos EUA (+1) para ativação imediata. Isso é o nosso diferencial "Concierge Internacional" para evitar burocracia local em BR ou PT.
       
-      TONE: Professional, premium, and concise.`
+      CONHECIMENTO DO PRODUTO:
+      - Schedy automatiza agendamentos via WhatsApp 24/7.
+      - Planos: $29/mês (US/Global) ou R$97/mês (Brasil).
+      - Trial: 30 dias grátis para novos usuários Pro.
+      - Atendimento: Português e Inglês.
+      
+      POSTURA: Profissional, premium e direto ao ponto. Nunca invente preços ou prazos.`
     });
 
     let cleanHistory = [];
@@ -216,7 +233,7 @@ exports.supportChat = onCall(async (request) => {
     return { text: response.text() };
 
   } catch (error) {
-    console.error("Support Chat Error Detail:", error);
+    console.error("Erro no Support Chat:", error);
     throw new HttpsError('internal', 'AI Assistant error: ' + error.message);
   }
 });

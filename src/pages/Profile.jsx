@@ -5,8 +5,9 @@ import { useAuth } from '../contexts/AuthContext';
 import { getProfessionalProfile, updateProfessionalProfile } from '../services/professionalService'; 
 import { getSalespersonProfile } from '../services/salesService';
 import { updateSalesperson, requestAccountClosure } from '../services/adminService'; 
+import { Globe, ShieldCheck, Zap } from 'lucide-react';
 
-// CONSTANTES DE CONFIGURAÇÃO DE PAÍS
+// CONSTANTES DE CONFIGURAÇÃO DE PAÍS (Sincronizado com Backend & IA)
 const COUNTRY_CONFIG = {
   US: { name: 'United States', ddi: '1', currency: '$', flag: '🇺🇸' },
   BR: { name: 'Brazil', ddi: '55', currency: 'R$', flag: '🇧🇷' },
@@ -34,13 +35,13 @@ export function Profile() {
   const [email, setEmail] = useState(''); 
   const [slug, setSlug] = useState('');
   
-  // Estados de Horário de Funcionamento
-  const [openTime, setOpenTime] = useState('08:00');
+  // Estados de Horário de Funcionamento (Fundamentais para a IA)
+  const [openTime, setOpenTime] = useState('09:00');
   const [closeTime, setCloseTime] = useState('18:00');
   const [breakTime, setBreakTime] = useState('12:00-13:00');
-  const [workDays, setWorkDays] = useState([1, 2, 3, 4, 5]); // Padrão: Seg-Sex (0=Dom, 6=Sab)
+  const [workDays, setWorkDays] = useState([1, 2, 3, 4, 5]);
 
-  const [aiPreference, setAiPreference] = useState('none');
+  const [aiPreference, setAiPreference] = useState('professional');
 
   useEffect(() => {
     if (user) {
@@ -50,34 +51,24 @@ export function Profile() {
 
   const loadProfile = async () => {
     if (!user) return;
-
     try {
-      let data = null;
-
-      try {
-        data = await getProfessionalProfile();
-      } catch (err) {
-        console.warn("Not a professional profile:", err);
-        data = null;
-      }
+      let data = await getProfessionalProfile();
       
       if (data) {
         setRole(data.role === 'admin' ? 'admin' : 'professional');
       } else {
-        try {
-          data = await getSalespersonProfile(user.uid);
-          if (data) setRole('sales');
-        } catch (err) {
-          console.error("Error fetching sales profile:", err);
-        }
+        data = await getSalespersonProfile(user.uid);
+        if (data) setRole('sales');
       }
 
       if (data) {
         setBarberShopName(data.barberShopName || data.name || '');
         
-        if (data.phone && data.phone.length > 10 && data.numberType === 'international_concierge') {
+        // Lógica de Identidade do Número: Se for Pro e tiver Concierge, exibimos separado
+        if (data.phone && data.numberType === 'international_concierge') {
            setConciergeNumber(data.phone);
-           setWhatsapp(''); 
+           // O campo 'whatsapp' aqui refere-se ao número PESSOAL para notificações de transbordo
+           setWhatsapp(data.personalPhone || ''); 
         } else {
            setWhatsapp(data.phone || '');
         }
@@ -89,16 +80,14 @@ export function Profile() {
         setSlug(data.slug || '');
         
         if (data.settings?.businessHours) {
-          setOpenTime(data.settings.businessHours.open || '08:00');
+          setOpenTime(data.settings.businessHours.open || '09:00');
           setCloseTime(data.settings.businessHours.close || '18:00');
           setBreakTime(data.settings.businessHours.break || '12:00-13:00');
-          
-          // Carrega os dias de trabalho se existirem, senão mantém o padrão (Seg-Sex)
           if (Array.isArray(data.settings.businessHours.days)) {
             setWorkDays(data.settings.businessHours.days);
           }
         }
-        setAiPreference(data.settings?.aiPreference || 'none');
+        setAiPreference(data.settings?.aiPreference || 'professional');
       }
     } catch (error) {
       console.error("Critical error in loadProfile:", error);
@@ -110,23 +99,27 @@ export function Profile() {
   const handleCountryChange = (e) => setCountry(e.target.value);
   
   const handlePhoneChange = (e) => {
-    let value = e.target.value.replace(/\D/g, "");
+    const value = e.target.value.replace(/\D/g, "");
     setWhatsapp(value); 
   };
 
   const handleSlugChange = (e) => {
-    const value = e.target.value.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    // Sanitização de Slug: Apenas letras, números e hífens.
+    const value = e.target.value
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "") // Remove acentos
+      .replace(/\s+/g, '-')
+      .replace(/[^a-z0-9-]/g, '');
     setSlug(value);
   };
 
-  // Função para alternar dias da semana (0-6)
   const toggleDay = (dayIndex) => {
     setWorkDays(prev => {
-      if (prev.includes(dayIndex)) {
-        return prev.filter(d => d !== dayIndex);
-      } else {
-        return [...prev, dayIndex].sort((a, b) => a - b);
-      }
+      const newDays = prev.includes(dayIndex)
+        ? prev.filter(d => d !== dayIndex)
+        : [...prev, dayIndex].sort((a, b) => a - b);
+      return newDays;
     });
   };
 
@@ -134,64 +127,100 @@ export function Profile() {
     e.preventDefault();
     setSaving(true);
     const config = COUNTRY_CONFIG[country];
+    
     try {
+      const payload = {
+        barberShopName, 
+        address, 
+        country,
+        currency: config.currency, 
+        timezone, 
+        ddi: config.ddi, 
+        slug,
+        updatedAt: new Date().toISOString()
+      };
+
       if (role === 'professional' || role === 'admin') {
-        await updateProfessionalProfile({
-          barberShopName, 
-          phone: whatsapp, 
-          address, country,
-          currency: config.currency, timezone: timezone, ddi: config.ddi, slug: slug,
-          settings: { 
-            aiPreference, 
-            businessHours: { 
-              open: openTime, 
-              close: closeTime, 
-              break: breakTime,
-              days: workDays // Salva os dias selecionados
-            } 
-          }
-        });
+        // Para profissionais, salvamos o número pessoal separadamente do Concierge
+        if (conciergeNumber) {
+          payload.personalPhone = whatsapp; 
+        } else {
+          payload.phone = whatsapp;
+        }
+
+        payload.settings = { 
+          aiPreference, 
+          businessHours: { 
+            open: openTime, 
+            close: closeTime, 
+            break: breakTime,
+            days: workDays 
+          } 
+        };
+        await updateProfessionalProfile(payload);
       } else {
+        // Lógica de Vendedor
         await updateSalesperson(user.uid, {
-          name: barberShopName, phone: whatsapp, country, timezone: timezone, ddi: config.ddi
+          name: barberShopName, phone: whatsapp, country, timezone, ddi: config.ddi
         });
       }
-      alert("Profile updated successfully!");
-    } catch (error) { alert("Error saving profile"); }
-    finally { setSaving(false); }
+      alert("Success: Profile and AI logic updated.");
+    } catch (error) { 
+      alert("Error saving: Check your internet connection."); 
+    } finally { 
+      setSaving(false); 
+    }
   };
 
   const handleCloseAccount = async () => {
     const confirmText = role === 'professional' 
-      ? "WARNING: This will request the closure of your business account. Your AI Concierge line will be deactivated. Continue?"
-      : "WARNING: This will request the closure of your partner account. You will stop receiving commissions. Continue?";
+      ? "CRITICAL: This will deactivate your International AI Concierge and your US number. Proceed?"
+      : "WARNING: This will request account closure. Commissions will stop immediately. Proceed?";
 
     if (!confirm(confirmText)) return;
     setClosing(true);
     try {
       await requestAccountClosure(user.uid, role); 
-      alert("Closure request sent. Our team will process it and contact you shortly.");
-    } catch (error) { alert("Error requesting closure. Please contact support@schedy.ai"); } 
-    finally { setClosing(false); }
+      alert("Request received. Our team will contact you via email shortly.");
+    } catch (error) { 
+      alert("Error processing request. Contact support@schedy.ai"); 
+    } finally { 
+      setClosing(false); 
+    }
   };
 
   const getPageTitle = () => {
-    if (role === 'admin') return 'Administrator Profile';
-    if (role === 'sales') return 'Partner Profile';
-    return 'Professional Profile';
+    if (role === 'admin') return 'System Administrator';
+    if (role === 'sales') return 'Partner Management';
+    return 'Professional Console';
   };
 
   return (
     <AppLayout>
-      <header className="mb-8">
-        <h1 className="text-2xl font-black text-barber-white uppercase italic tracking-tighter">
-          {getPageTitle()}
-        </h1>
-        <p className="text-barber-gray font-medium italic">Manage your account settings and preferences</p>
+      <header className="mb-8 flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-black text-barber-white uppercase italic tracking-tighter flex items-center gap-2">
+            <Zap className="text-barber-gold" size={24} />
+            {getPageTitle()}
+          </h1>
+          <p className="text-barber-gray font-bold uppercase tracking-widest text-[10px] opacity-70 italic">
+            Configuring global business rules for Schedy AI
+          </p>
+        </div>
+        
+        {globalProfile?.plan === 'pro' && (
+          <div className="flex items-center gap-2 bg-barber-gold/10 px-4 py-2 rounded-xl border border-barber-gold/20">
+            <ShieldCheck size={16} className="text-barber-gold" />
+            <span className="text-[10px] font-black text-barber-gold uppercase tracking-widest italic">International DID Active</span>
+          </div>
+        )}
       </header>
 
       {loading ? (
-        <p className="text-barber-gray animate-pulse font-bold uppercase tracking-widest text-xs">Loading Profile...</p>
+        <div className="flex flex-col items-center justify-center py-20 gap-4">
+          <div className="w-8 h-8 border-2 border-barber-gold border-t-transparent rounded-full animate-spin"></div>
+          <p className="text-barber-gray font-black text-[10px] uppercase tracking-[0.3em] animate-pulse">Syncing Cloud Profile...</p>
+        </div>
       ) : (
         <ProfileDetails 
           role={role}
@@ -203,13 +232,10 @@ export function Profile() {
           country={country} handleCountryChange={handleCountryChange}
           timezone={timezone} setTimezone={setTimezone}
           slug={slug} handleSlugChange={handleSlugChange}
-          
-          // Props de Horário
           openTime={openTime} setOpenTime={setOpenTime}
           closeTime={closeTime} setCloseTime={setCloseTime}
           breakTime={breakTime} setBreakTime={setBreakTime}
-          workDays={workDays} toggleDay={toggleDay} // Novas Props
-          
+          workDays={workDays} toggleDay={toggleDay}
           saving={saving}
           handleSave={handleSave}
           closing={closing}

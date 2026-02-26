@@ -1754,15 +1754,13 @@ export function Services() {
 ```javascript
 import React, { useState, useEffect } from 'react';
 import { AppLayout } from '../components/ui/AppLayout';
-import { ProfileDetails } from '../components/profile/ProfileDetails'; // Importa o componente visual
-import { auth } from '../services/firebase';
+import { ProfileDetails } from '../components/profile/ProfileDetails'; 
 import { useAuth } from '../contexts/AuthContext'; 
 import { getProfessionalProfile, updateProfessionalProfile } from '../services/professionalService'; 
 import { getSalespersonProfile } from '../services/salesService';
 import { updateSalesperson, requestAccountClosure } from '../services/adminService'; 
 
-// CONSTANTES QUE ANTES ESTAVAM AQUI AGORA ESTÃO NO COMPONENTE DETALHES
-// MAS PRECISAMOS DA CONFIGURAÇÃO DE PAÍS AQUI PARA O SALVAMENTO
+// CONSTANTES DE CONFIGURAÇÃO DE PAÍS
 const COUNTRY_CONFIG = {
   US: { name: 'United States', ddi: '1', currency: '$', flag: '🇺🇸' },
   BR: { name: 'Brazil', ddi: '55', currency: 'R$', flag: '🇧🇷' },
@@ -1789,9 +1787,13 @@ export function Profile() {
   const [address, setAddress] = useState('');
   const [email, setEmail] = useState(''); 
   const [slug, setSlug] = useState('');
+  
+  // Estados de Horário de Funcionamento
   const [openTime, setOpenTime] = useState('08:00');
   const [closeTime, setCloseTime] = useState('18:00');
   const [breakTime, setBreakTime] = useState('12:00-13:00');
+  const [workDays, setWorkDays] = useState([1, 2, 3, 4, 5]); // Padrão: Seg-Sex (0=Dom, 6=Sab)
+
   const [aiPreference, setAiPreference] = useState('none');
 
   useEffect(() => {
@@ -1844,6 +1846,11 @@ export function Profile() {
           setOpenTime(data.settings.businessHours.open || '08:00');
           setCloseTime(data.settings.businessHours.close || '18:00');
           setBreakTime(data.settings.businessHours.break || '12:00-13:00');
+          
+          // Carrega os dias de trabalho se existirem, senão mantém o padrão (Seg-Sex)
+          if (Array.isArray(data.settings.businessHours.days)) {
+            setWorkDays(data.settings.businessHours.days);
+          }
         }
         setAiPreference(data.settings?.aiPreference || 'none');
       }
@@ -1854,18 +1861,27 @@ export function Profile() {
     }
   };
 
-  // HANDLERS AGORA APENAS ATUALIZAM O ESTADO
   const handleCountryChange = (e) => setCountry(e.target.value);
   
   const handlePhoneChange = (e) => {
     let value = e.target.value.replace(/\D/g, "");
-    // Lógica simplificada de máscara aqui (a visual é controlada pelo input mas o valor bruto fica no estado)
     setWhatsapp(value); 
   };
 
   const handleSlugChange = (e) => {
     const value = e.target.value.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
     setSlug(value);
+  };
+
+  // Função para alternar dias da semana (0-6)
+  const toggleDay = (dayIndex) => {
+    setWorkDays(prev => {
+      if (prev.includes(dayIndex)) {
+        return prev.filter(d => d !== dayIndex);
+      } else {
+        return [...prev, dayIndex].sort((a, b) => a - b);
+      }
+    });
   };
 
   const handleSave = async (e) => {
@@ -1879,7 +1895,15 @@ export function Profile() {
           phone: whatsapp, 
           address, country,
           currency: config.currency, timezone: timezone, ddi: config.ddi, slug: slug,
-          settings: { aiPreference, businessHours: { open: openTime, close: closeTime, break: breakTime } }
+          settings: { 
+            aiPreference, 
+            businessHours: { 
+              open: openTime, 
+              close: closeTime, 
+              break: breakTime,
+              days: workDays // Salva os dias selecionados
+            } 
+          }
         });
       } else {
         await updateSalesperson(user.uid, {
@@ -1933,9 +1957,13 @@ export function Profile() {
           country={country} handleCountryChange={handleCountryChange}
           timezone={timezone} setTimezone={setTimezone}
           slug={slug} handleSlugChange={handleSlugChange}
+          
+          // Props de Horário
           openTime={openTime} setOpenTime={setOpenTime}
           closeTime={closeTime} setCloseTime={setCloseTime}
           breakTime={breakTime} setBreakTime={setBreakTime}
+          workDays={workDays} toggleDay={toggleDay} // Novas Props
+          
           saving={saving}
           handleSave={handleSave}
           closing={closing}
@@ -2162,6 +2190,38 @@ const US_AREA_CODES = [
   { code: 'random', city: 'Instant Allocation' },
 ];
 
+// Dicionário de Mensagens Localizadas
+const COUNTRY_MESSAGES = {
+  US: { 
+    text: "Hello! I'd like to schedule an appointment with {NAME}. Please send this message to start.", 
+    lang: "en" 
+  },
+  GB: { 
+    text: "Hello! I'd like to schedule an appointment with {NAME}. Please send this message to start.", 
+    lang: "en" 
+  },
+  BR: { 
+    text: "Olá! Gostaria de agendar um horário com {NAME}. Por favor, envie esta mensagem para iniciar.", 
+    lang: "pt-BR" 
+  },
+  PT: { 
+    text: "Olá! Gostaria de marcar um serviço com {NAME}. Por favor, envie esta mensagem para iniciar.", 
+    lang: "pt-PT" 
+  },
+  ES: { 
+    text: "¡Hola! Quisiera reservar una cita con {NAME}. Por favor, envíe este mensaje para comenzar.", 
+    lang: "es" 
+  },
+  FR: { 
+    text: "Bonjour ! Je voudrais prendre rendez-vous avec {NAME}. Veuillez envoyer ce message pour commencer.", 
+    lang: "fr" 
+  },
+  IT: { 
+    text: "Ciao! Vorrei prenotare un appuntamento con {NAME}. Per favore invia questo messaggio per iniziare.", 
+    lang: "it" 
+  }
+};
+
 const CONCIERGE_NUMBER = "+14454563363"; 
 
 export function SetupPro() {
@@ -2236,9 +2296,19 @@ export function SetupPro() {
      );
   }
 
+  // --- LÓGICA DE INTERNACIONALIZAÇÃO ---
   const identifier = profile.slug || tenantId;
   const businessName = profile.barberShopName || "the professional";
-  const initialMessage = `Hello! I'd like to book an appointment with ${businessName}. (ID: ${identifier})`;
+  
+  // Seleciona a configuração baseada no país do perfil, ou usa US como fallback
+  const localeConfig = COUNTRY_MESSAGES[profile.country] || COUNTRY_MESSAGES.US;
+  
+  // Monta a mensagem substituindo o nome
+  const localizedText = localeConfig.text.replace('{NAME}', businessName);
+  
+  // Adiciona o ID no final (obrigatório para o sistema funcionar)
+  const initialMessage = `${localizedText} (ID: ${identifier})`;
+  
   const whatsappLink = `https://wa.me/${CONCIERGE_NUMBER.replace(/\D/g, '')}?text=${encodeURIComponent(initialMessage)}`;
 
   // VIEW: SETUP / ACTIVATION

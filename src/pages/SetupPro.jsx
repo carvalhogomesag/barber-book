@@ -11,59 +11,40 @@ import {
   ShieldCheck,
   Zap,
   MapPin,
-  Lock
+  Lock,
+  ExternalLink
 } from 'lucide-react';
 import { QRCodeCanvas } from 'qrcode.react'; 
 import { provisionConciergeNumber, getProfessionalProfile } from '../services/professionalService'; 
 
-// Opções de Area Codes dos EUA
+// Opções de Area Codes dos EUA (Foco em cidades de prestígio)
 const US_AREA_CODES = [
   { code: '305', city: 'Miami, FL' },
   { code: '212', city: 'New York, NY' },
   { code: '407', city: 'Orlando, FL' },
   { code: '702', city: 'Las Vegas, NV' },
+  { code: '832', city: 'Houston, TX' },
   { code: 'random', city: 'Instant Allocation' },
 ];
 
-// Dicionário de Mensagens Localizadas
+// Dicionário de Mensagens Localizadas (Ajustado para clareza do ID)
 const COUNTRY_MESSAGES = {
-  US: { 
-    text: "Hello! I'd like to schedule an appointment with {NAME}. Please send this message to start.", 
-    lang: "en" 
-  },
-  GB: { 
-    text: "Hello! I'd like to schedule an appointment with {NAME}. Please send this message to start.", 
-    lang: "en" 
-  },
-  BR: { 
-    text: "Olá! Gostaria de agendar um horário com {NAME}. Por favor, envie esta mensagem para iniciar.", 
-    lang: "pt-BR" 
-  },
-  PT: { 
-    text: "Olá! Gostaria de marcar um serviço com {NAME}. Por favor, envie esta mensagem para iniciar.", 
-    lang: "pt-PT" 
-  },
-  ES: { 
-    text: "¡Hola! Quisiera reservar una cita con {NAME}. Por favor, envíe este mensaje para comenzar.", 
-    lang: "es" 
-  },
-  FR: { 
-    text: "Bonjour ! Je voudrais prendre rendez-vous avec {NAME}. Veuillez envoyer ce message pour commencer.", 
-    lang: "fr" 
-  },
-  IT: { 
-    text: "Ciao! Vorrei prenotare un appuntamento con {NAME}. Per favore invia questo messaggio per iniziare.", 
-    lang: "it" 
-  }
+  US: { text: "Hello! I'd like to schedule an appointment with {NAME}.", lang: "en" },
+  GB: { text: "Hello! I'd like to schedule an appointment with {NAME}.", lang: "en" },
+  BR: { text: "Olá! Gostaria de agendar um horário com {NAME}.", lang: "pt-BR" },
+  PT: { text: "Olá! Gostaria de marcar um serviço com {NAME}.", lang: "pt-PT" },
+  ES: { text: "¡Hola! Quisiera reservar una cita con {NAME}.", lang: "es" },
+  FR: { text: "Bonjour ! Je voudrais prendre rendez-vous avec {NAME}.", lang: "fr" },
+  IT: { text: "Ciao! Vorrei prenotare un appuntamento con {NAME}.", lang: "it" }
 };
 
+// Número global do Concierge (Deve bater com o do backend)
 const CONCIERGE_NUMBER = "+14454563363"; 
 
 export function SetupPro() {
   const [profile, setProfile] = useState(null);
   const [pageLoading, setPageLoading] = useState(true);
   const [activationLoading, setActivationLoading] = useState(false);
-  const [tenantId, setTenantId] = useState(null);
   const [isActivated, setIsActivated] = useState(false); 
   const [copied, setCopied] = useState(false); 
   const [selectedAreaCode, setSelectedAreaCode] = useState('random');
@@ -74,8 +55,7 @@ export function SetupPro() {
         const data = await getProfessionalProfile();
         if (data && data.plan === 'pro') {
           setProfile(data);
-          setTenantId(data.id); 
-          
+          // Se já tem telefone e o país é US, já está ativado
           if (data.phone && data.numberCountry === 'US') {
              setIsActivated(true);
           }
@@ -92,10 +72,12 @@ export function SetupPro() {
   const handleActivate = async () => {
     setActivationLoading(true);
     try {
+      // Chama a cloud function que atualiza o perfil para US Concierge
       await provisionConciergeNumber({ areaCode: selectedAreaCode }); 
       setIsActivated(true);
     } catch (error) {
-      alert("Error activating Concierge. Please contact support.");
+      console.error(error);
+      alert("Error activating Concierge. Our team has been notified.");
     } finally {
       setActivationLoading(false);
     }
@@ -112,91 +94,94 @@ export function SetupPro() {
       <AppLayout>
         <div className="flex flex-col items-center justify-center mt-40 gap-4">
           <Loader2 className="animate-spin text-barber-gold" size={48} />
-          <p className="text-barber-gray animate-pulse font-medium tracking-tight">Finalizing your pro dashboard...</p>
+          <p className="text-barber-gray animate-pulse font-bold uppercase tracking-widest text-xs">Syncing with US Infrastructure...</p>
         </div>
       </AppLayout>
     );
   }
 
+  // Proteção: Apenas usuários PRO acessam esta página
   if (!profile || profile.plan !== 'pro') {
      return (
       <AppLayout>
-        <div className="max-w-md mx-auto mt-20 text-center bg-red-500/10 border border-red-500/50 p-8 rounded-2xl">
-          <ShieldCheck className="text-red-500 mx-auto mb-4" size={48} />
-          <h2 className="text-white font-bold text-xl mb-2">Pro Feature Only</h2>
-          <p className="text-zinc-400 text-sm mb-6">Upgrade your account to activate your AI Concierge and get your dedicated US number.</p>
-          <Button onClick={() => window.location.href = '/pricing'}>View Pro Plans</Button>
+        <div className="max-w-md mx-auto mt-20 text-center bg-zinc-900 border border-zinc-800 p-10 rounded-3xl shadow-2xl">
+          <Zap className="text-barber-gold mx-auto mb-4" size={48} />
+          <h2 className="text-white font-black text-2xl mb-2 uppercase italic tracking-tighter">AI Concierge Required</h2>
+          <p className="text-zinc-500 text-sm mb-8 italic">You need an active Pro Plan to provision your International US (+1) Number.</p>
+          <Button onClick={() => window.location.href = '/pricing'} className="w-full">Upgrade Now</Button>
         </div>
       </AppLayout>
      );
   }
 
-  // --- LÓGICA DE INTERNACIONALIZAÇÃO ---
-  const identifier = profile.slug || tenantId;
-  const businessName = profile.barberShopName || "the professional";
-  
-  // Seleciona a configuração baseada no país do perfil, ou usa US como fallback
+  // --- LÓGICA DE GERAÇÃO DO LINK ---
+  const identifier = profile.slug || profile.id;
+  const businessName = profile.barberShopName || profile.name;
   const localeConfig = COUNTRY_MESSAGES[profile.country] || COUNTRY_MESSAGES.US;
   
-  // Monta a mensagem substituindo o nome
+  // A mensagem contém o ID técnico para a IA saber qual agenda ler
   const localizedText = localeConfig.text.replace('{NAME}', businessName);
-  
-  // Adiciona o ID no final (obrigatório para o sistema funcionar)
-  const initialMessage = `${localizedText} (ID: ${identifier})`;
+  const initialMessage = `${localizedText} (Ref: ${identifier})`;
   
   const whatsappLink = `https://wa.me/${CONCIERGE_NUMBER.replace(/\D/g, '')}?text=${encodeURIComponent(initialMessage)}`;
 
-  // VIEW: SETUP / ACTIVATION
+  // VIEW 1: ESTADO INICIAL (ATIVAÇÃO)
   if (!isActivated) {
     return (
         <AppLayout>
-            <div className="max-w-2xl mx-auto mt-10">
-                <div className="bg-barber-black border border-zinc-800 p-8 md:p-12 rounded-3xl shadow-2xl">
-                    <div className="flex items-center gap-4 mb-8">
-                      <div className="bg-barber-gold/10 p-4 rounded-2xl text-barber-gold border border-barber-gold/20">
-                          <Zap size={32} className="fill-current" />
-                      </div>
-                      <div>
-                        <h1 className="text-3xl font-black text-barber-white tracking-tighter uppercase italic text-left">Your 30-Day Trial is Active!</h1>
-                        <p className="text-barber-gray text-sm text-left">Let's connect your AI Concierge to a phone number.</p>
-                      </div>
+            <div className="max-w-2xl mx-auto mt-6 animate-in fade-in slide-in-from-bottom-4 duration-700">
+                <div className="bg-barber-black border border-zinc-800 p-8 md:p-12 rounded-3xl shadow-2xl relative overflow-hidden">
+                    <div className="absolute top-0 right-0 p-4 opacity-10">
+                        <Globe size={120} />
                     </div>
 
-                    <div className="bg-zinc-900/50 p-6 rounded-2xl border border-zinc-800 mb-8 text-left">
-                      <h3 className="text-white font-bold mb-4 flex items-center gap-2">
-                        <MapPin size={18} className="text-barber-gold" /> Choose your preferred Area Code
-                      </h3>
+                    <div className="flex flex-col gap-2 mb-10">
+                      <h1 className="text-4xl font-black text-barber-white tracking-tighter uppercase italic">
+                        Activate <span className="text-barber-gold">Global</span> Authority
+                      </h1>
+                      <p className="text-zinc-500 font-medium italic">Your AI Concierge will be provisioned with an instant US (+1) virtual line.</p>
+                    </div>
+
+                    <div className="bg-zinc-900/50 p-6 rounded-2xl border border-zinc-800 mb-8">
+                      <label className="text-[10px] font-black text-barber-gold uppercase tracking-[0.2em] mb-4 block italic">
+                        Select International Area Code
+                      </label>
                       <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
                         {US_AREA_CODES.map((item) => (
                           <button
                             key={item.code}
                             type="button"
                             onClick={() => setSelectedAreaCode(item.code)}
-                            className={`p-4 rounded-xl border text-left transition-all ${
+                            className={`p-4 rounded-xl border text-left transition-all duration-300 ${
                               selectedAreaCode === item.code 
-                              ? 'bg-barber-gold border-barber-gold text-black' 
-                              : 'bg-black border-zinc-800 text-zinc-500 hover:border-zinc-600'
+                              ? 'bg-barber-gold border-barber-gold text-black shadow-lg shadow-barber-gold/20' 
+                              : 'bg-black border-zinc-800 text-zinc-500 hover:border-zinc-700'
                             }`}
                           >
-                            <p className="text-lg font-black">{item.code === 'random' ? 'Any' : item.code}</p>
-                            <p className="text-[10px] font-bold uppercase opacity-80 leading-none mt-1">{item.city}</p>
+                            <p className="text-xl font-black italic">{item.code === 'random' ? 'ANY' : item.code}</p>
+                            <p className="text-[10px] font-bold uppercase opacity-80 truncate">{item.city}</p>
                           </button>
                         ))}
                       </div>
                     </div>
                     
-                    <div className="space-y-4 mb-10 text-left">
-                      <div className="flex items-start gap-4 p-4 bg-barber-gold/5 rounded-xl border border-barber-gold/10">
-                        <CheckCircle size={20} className="text-barber-gold shrink-0 mt-1" />
-                        <div>
-                          <p className="text-sm font-bold text-white italic uppercase tracking-tighter">Ready to work 24/7</p>
-                          <p className="text-xs text-zinc-500 leading-relaxed">Your AI assistant will use this number to talk to clients and fill your schedule while you're busy with your clippers.</p>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-10">
+                        <div className="flex items-start gap-3 p-4 bg-zinc-900/30 rounded-xl border border-zinc-800">
+                            <Zap size={18} className="text-barber-gold shrink-0" />
+                            <p className="text-[11px] text-zinc-400 leading-tight">Instant activation. No documents required for US lines.</p>
                         </div>
-                      </div>
+                        <div className="flex items-start gap-3 p-4 bg-zinc-900/30 rounded-xl border border-zinc-800">
+                            <ShieldCheck size={18} className="text-barber-gold shrink-0" />
+                            <p className="text-[11px] text-zinc-400 leading-tight">Enterprise-grade stability for 24/7 automated booking.</p>
+                        </div>
                     </div>
 
-                    <Button onClick={handleActivate} loading={activationLoading} className="w-full h-16 text-xl shadow-xl shadow-barber-gold/10 font-black italic uppercase tracking-tighter">
-                        {activationLoading ? "Setting up your line..." : `Activate My Assistant Now`}
+                    <Button 
+                        onClick={handleActivate} 
+                        loading={activationLoading} 
+                        className="w-full h-16 text-xl font-black italic uppercase tracking-tighter shadow-xl shadow-barber-gold/5"
+                    >
+                        {activationLoading ? "Provisioning US Line..." : "Activate International Concierge"}
                     </Button>
                 </div>
             </div>
@@ -204,99 +189,116 @@ export function SetupPro() {
     );
   }
 
-  // VIEW: LIVE / ACTIVATED
+  // VIEW 2: ESTADO ATIVADO (QR CODE E LINKS)
   return (
     <AppLayout>
-      <div className="max-w-3xl mx-auto mt-6">
-        <div className="bg-barber-black border-2 border-barber-gold p-10 rounded-3xl shadow-2xl text-center relative overflow-hidden">
+      <div className="max-w-4xl mx-auto mt-6 animate-in zoom-in-95 duration-500">
+        <div className="bg-barber-black border-2 border-barber-gold p-8 md:p-12 rounded-[40px] shadow-2xl relative overflow-hidden">
           
-          <div className="absolute top-0 right-0 bg-barber-gold text-black px-6 py-1 font-black text-[10px] uppercase tracking-widest rounded-bl-xl italic">
-            30-Day Trial Active
+          <div className="absolute top-6 right-8 flex items-center gap-2 bg-green-500/10 text-green-500 px-4 py-1.5 rounded-full border border-green-500/20">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+            </span>
+            <span className="text-[10px] font-black uppercase tracking-widest italic">Live & Operational</span>
           </div>
 
-          <CheckCircle size={64} className="text-green-500 mx-auto mb-6" />
-          <h1 className="text-4xl font-black text-barber-white mb-2 uppercase italic tracking-tighter">You're on Autopilot</h1>
-          <p className="text-barber-gray mb-10 max-w-md mx-auto font-medium">
-            Your AI Concierge is now live and taking bookings. <br/>
-            <span className="text-white font-bold">Share your link below to get started.</span>
-          </p>
+          <div className="text-center mb-12">
+            <h1 className="text-4xl font-black text-barber-white uppercase italic tracking-tighter mb-2">Concierge <span className="text-barber-gold">Deployed</span></h1>
+            <p className="text-zinc-500 font-medium italic">Your US-based AI is now handling your WhatsApp schedule.</p>
+          </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-10 items-start">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
             
-            <div className="bg-zinc-900 p-8 rounded-2xl border border-zinc-800 flex flex-col items-center shadow-inner">
-                <div className="bg-white p-4 rounded-2xl mb-6 shadow-2xl">
+            {/* QR CODE SECTION */}
+            <div className="flex flex-col items-center">
+                <div className="bg-white p-6 rounded-[32px] shadow-2xl mb-6 relative group">
                     <QRCodeCanvas 
                         id="qr-concierge"
                         value={whatsappLink} 
-                        size={200}
+                        size={220}
                         level={"H"}
+                        includeMargin={false}
                     />
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/80 opacity-0 group-hover:opacity-100 transition-opacity rounded-[32px]">
+                         <Button variant="outline" className="w-auto h-10 text-[10px]" onClick={() => {
+                            const canvas = document.getElementById('qr-concierge');
+                            const url = canvas.toDataURL("image/png");
+                            const link = document.createElement('a');
+                            link.download = `schedy-qr-${identifier}.png`;
+                            link.href = url;
+                            link.click();
+                         }}>
+                            <Download size={14} className="mr-2" /> Download PNG
+                         </Button>
+                    </div>
                 </div>
-                <p className="text-[10px] text-zinc-500 font-bold uppercase tracking-widest mb-4">Clients scan this to book</p>
-                <button 
-                    type="button"
-                    onClick={() => {
-                        const canvas = document.getElementById('qr-concierge');
-                        const url = canvas.toDataURL("image/png");
-                        const link = document.createElement('a');
-                        link.download = `my-booking-qr.png`;
-                        link.href = url;
-                        link.click();
-                    }}
-                    className="flex items-center gap-2 text-zinc-400 text-xs hover:text-white transition-colors font-bold uppercase tracking-tighter"
-                >
-                    <Download size={14} /> Download Image
-                </button>
+                <p className="text-[10px] text-zinc-500 font-black uppercase tracking-[0.3em] italic">Scan to Book via AI</p>
             </div>
 
-            <div className="flex flex-col gap-6 text-left">
-                <div className="bg-zinc-900/80 p-5 rounded-2xl border border-zinc-800">
-                    <label className="text-[10px] font-black text-zinc-500 uppercase mb-2 block tracking-widest italic">Your Professional AI Line</label>
-                    <span className="text-2xl font-mono font-bold text-barber-gold tracking-tighter">{CONCIERGE_NUMBER}</span>
+            {/* DETAILS SECTION */}
+            <div className="space-y-6">
+                <div className="bg-zinc-900/80 p-6 rounded-2xl border border-zinc-800">
+                    <label className="text-[10px] font-black text-zinc-500 uppercase mb-2 block tracking-widest italic">Dedicated International Line</label>
+                    <div className="flex items-center gap-3">
+                        <span className="text-3xl font-black text-barber-gold tracking-tighter italic">{CONCIERGE_NUMBER}</span>
+                        <div className="bg-barber-gold/10 px-2 py-0.5 rounded text-[8px] font-black text-barber-gold border border-barber-gold/20 uppercase">USA Virtual DID</div>
+                    </div>
                 </div>
 
-                <div className="bg-zinc-900/80 p-5 rounded-2xl border border-zinc-800">
-                    <label className="text-[10px] font-black text-zinc-500 uppercase mb-2 block tracking-widest italic">Your Booking Link</label>
-                    <div className="flex items-center gap-3 mt-1">
-                        <div className="bg-black/50 text-[10px] text-zinc-400 w-full p-3 rounded-lg truncate font-mono border border-zinc-800/50">
+                <div className="bg-zinc-900/80 p-6 rounded-2xl border border-zinc-800">
+                    <label className="text-[10px] font-black text-zinc-500 uppercase mb-2 block tracking-widest italic">Your Smart Booking Link</label>
+                    <div className="flex items-center gap-3">
+                        <div className="bg-black/50 text-[10px] text-zinc-400 w-full p-4 rounded-xl truncate font-mono border border-zinc-800/50 italic">
                             {whatsappLink}
                         </div>
                         <button 
                             type="button"
                             onClick={() => copyToClipboard(whatsappLink)}
-                            className="p-3 bg-barber-gold text-black rounded-lg hover:bg-yellow-600 transition-all shrink-0 active:scale-95"
+                            className="p-4 bg-barber-gold text-black rounded-xl hover:scale-105 transition-all active:scale-95 shadow-lg shadow-barber-gold/10"
                         >
                             {copied ? <Check size={20} /> : <Copy size={20} />}
                         </button>
                     </div>
                 </div>
 
-                <div className="p-5 border-l-4 border-barber-gold bg-zinc-900/50 rounded-r-2xl">
-                    <div className="flex items-center gap-2 mb-2 text-left">
-                      <Lock size={12} className="text-zinc-500" />
-                      <h4 className="text-zinc-400 text-[10px] font-black uppercase tracking-widest italic">Privacy Guaranteed</h4>
+                <div className="p-6 bg-barber-gold/5 border-l-4 border-barber-gold rounded-r-2xl">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Lock size={14} className="text-barber-gold" />
+                      <h4 className="text-zinc-300 text-[10px] font-black uppercase tracking-widest italic">Security Note</h4>
                     </div>
-                    <p className="text-[10px] text-zinc-500 leading-relaxed font-medium text-left">
-                        Schedy AI only monitors booking requests sent to your dedicated line. <span className="text-zinc-300">Your personal WhatsApp conversations stay private.</span>
+                    <p className="text-[11px] text-zinc-500 leading-relaxed font-medium italic">
+                        This dedicated US line handles <strong>only</strong> booking requests via the Schedy protocol. Personal messages sent to this number are processed by the AI for appointment intent only.
                     </p>
                 </div>
             </div>
           </div>
 
           <div className="mt-12 pt-8 border-t border-zinc-800 flex flex-col sm:flex-row gap-4">
-            <Button onClick={() => window.location.href = '/dashboard'} className="flex-1 h-14 uppercase font-black italic tracking-tighter shadow-lg">
-              View My Schedule
+            <Button onClick={() => window.location.href = '/dashboard'} className="flex-1 h-14 uppercase font-black italic tracking-tighter">
+              Manage Calendar
             </Button>
-            <Button onClick={() => window.location.href = '/profile'} variant="outline" className="flex-1 h-14 uppercase font-black italic tracking-tighter border-zinc-800 text-zinc-400 hover:text-white">
-              Edit Business Info
+            <Button 
+                onClick={() => window.open(whatsappLink, '_blank')} 
+                variant="outline" 
+                className="flex-1 h-14 uppercase font-black italic tracking-tighter gap-2"
+            >
+              Test AI Chat <ExternalLink size={16} />
             </Button>
           </div>
         </div>
+
+        <div className="mt-8 flex items-center justify-center gap-6 opacity-30">
+            <div className="flex items-center gap-2">
+                <ShieldCheck size={14} />
+                <span className="text-[9px] font-black uppercase tracking-widest">Encrypted</span>
+            </div>
+            <div className="flex items-center gap-2">
+                <Globe size={14} />
+                <span className="text-[9px] font-black uppercase tracking-widest">Global DID System</span>
+            </div>
+        </div>
       </div>
-      
-      <p className="text-center text-zinc-700 text-[9px] mt-8 uppercase font-bold tracking-[0.3em] italic">
-          International Concierge Powered by Schedy AI
-      </p>
     </AppLayout>
   );
 }

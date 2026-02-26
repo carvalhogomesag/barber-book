@@ -1,13 +1,14 @@
 /**
- * functions/utils.js
- * Utilitários de Data e Hora para o Schedy AI
+ * functions/src/utils.js
+ * Motor de Precisão Temporal para Schedy AI (International Concierge)
  */
 
-exports.getSchedulerContext = (timezone) => {
+exports.getSchedulerContext = (timezone = "UTC") => {
+    // 1. Instância de tempo absoluto (Ponto Zero)
     const agoraUTC = new Date();
 
-    // 1. Obtém a data HOJE no fuso horário do profissional (Formato YYYY-MM-DD)
-    // Usamos 'en-CA' pois é o único locale que o Intl retorna nativamente como YYYY-MM-DD
+    // 2. ÂNCORA HOJE (Data Local do Profissional)
+    // Usamos en-CA para garantir o padrão ISO-8601 (YYYY-MM-DD) sem manipulação de string complexa
     const hojeLocalISO = new Intl.DateTimeFormat('en-CA', {
         timeZone: timezone,
         year: 'numeric',
@@ -15,51 +16,65 @@ exports.getSchedulerContext = (timezone) => {
         day: '2-digit'
     }).format(agoraUTC);
 
-    // 2. Obtém a hora atual no fuso do profissional (Formato HH:mm)
-    const currentTimeLocal = new Intl.DateTimeFormat('en-US', {
+    // 3. HORA LOCAL (HH:mm)
+    // Importante: A IA precisa saber exatamente que horas são lá para não agendar no passado
+    const currentTimeLocal = new Intl.DateTimeFormat('en-GB', {
         timeZone: timezone,
         hour: '2-digit',
         minute: '2-digit',
         hour12: false
     }).format(agoraUTC);
 
-    // 3. Gera o Menu de 9 Dias ancorado no "Hoje Local" absoluto
-    const dateMenu = [];
-    for (let i = 0; i < 9; i++) {
-        // Ancoramos no meio-dia do dia calculado para evitar problemas de fuso na virada do dia
-        const d = new Date(hojeLocalISO + "T12:00:00");
-        d.setDate(d.getDate() + i);
+    // 4. DIA DA SEMANA ATUAL (0-6)
+    // 0 = Sunday, 1 = Monday...
+    // Essencial para bater com as configurações de 'days' [1,2,3,4,5] do barbeiro
+    const currentDayOfWeek = new Date(agoraUTC.toLocaleString("en-US", { timeZone: timezone })).getDay();
 
-        // Formata o ISO do dia do menu
-        const iso = new Intl.DateTimeFormat('en-CA', {
+    // 5. GERAÇÃO DO CALENDÁRIO DINÂMICO (Look-up Table para a IA)
+    // Geramos 10 dias de opções para cobrir feriados e fins de semana
+    const dateMenu = [];
+    for (let i = 0; i < 10; i++) {
+        // Âncora de Meio-dia: Evita que o fuso pule o dia por causa de 1 ou 2 horas de diferença
+        const refDate = new Date(`${hojeLocalISO}T12:00:00`);
+        refDate.setDate(refDate.getDate() + i);
+
+        const isoDate = new Intl.DateTimeFormat('en-CA', {
             timeZone: timezone,
             year: 'numeric',
             month: '2-digit',
             day: '2-digit'
-        }).format(d);
+        }).format(refDate);
 
-        // Gera a etiqueta amigável (Today, Tomorrow ou Weekday)
-        let label;
-        if (i === 0) label = "Today";
-        else if (i === 1) label = "Tomorrow";
-        else {
-            label = new Intl.DateTimeFormat('en-US', { 
-                timeZone: timezone, 
-                weekday: 'long', 
-                month: 'short', 
-                day: 'numeric' 
-            }).format(d);
-        }
+        const dayName = new Intl.DateTimeFormat('en-US', { 
+            timeZone: timezone, 
+            weekday: 'long' 
+        }).format(refDate);
 
-        dateMenu.push({ index: i + 1, label, iso });
+        const numericDay = refDate.getDay();
+
+        let friendlyLabel;
+        if (i === 0) friendlyLabel = "Today";
+        else if (i === 1) friendlyLabel = "Tomorrow";
+        else friendlyLabel = dayName;
+
+        dateMenu.push({
+            option: i + 1,
+            label: friendlyLabel,
+            iso: isoDate,
+            dayOfWeek: numericDay
+        });
     }
 
-    const dateMenuString = dateMenu.map(d => `${d.index}) ${d.label} (${d.iso})`).join("\n");
+    // String formatada para o System Prompt da IA (Contexto de Decisão)
+    const dateMenuString = dateMenu
+        .map(d => `${d.option}) ${d.label} - ${d.iso} (${d.dayOfWeek})`)
+        .join("\n");
 
     return {
-        hojeLocalISO,
-        currentTimeLocal,
-        dateMenu,
-        dateMenuString
+        hojeLocalISO,         // YYYY-MM-DD
+        currentTimeLocal,    // HH:mm
+        currentDayOfWeek,    // 0-6
+        dateMenu,            // Array de objetos para ferramentas
+        dateMenuString       // Texto pronto para o Prompt
     };
 };
