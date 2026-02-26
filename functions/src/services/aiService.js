@@ -12,7 +12,7 @@ const HUMAN_HANDOFF_KEYWORDS = [
 ];
 
 /**
- * Auxiliar: Verifica sobreposição de horários
+ * Auxiliar: Verifica sobreposição de horários (Precisão Cirúrgica)
  */
 const isOverlapping = (startA, durationA, startB, durationB) => {
   const aBegin = new Date(startA).getTime();
@@ -41,32 +41,52 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
     },
     
     get_realtime_agenda: async () => {
+      // FORÇA LEITURA DIRETA DO FIRESTORE (SEM CACHE)
       const snap = await db.collection("barbers").doc(barberId).collection("appointments").get();
-      if (snap.empty) return "VERDICT: The agenda is currently EMPTY.";
-      const appointments = snap.docs.map(doc => ({ client: doc.data().clientName, service: doc.data().serviceName, time: doc.data().startTime, duration: doc.data().duration }));
-      return `VERDICT: ${JSON.stringify(appointments)}`;
+      if (snap.empty) return "VERDICT: The agenda is currently EMPTY. All slots are available.";
+      
+      const appointments = snap.docs.map(doc => ({
+          client: doc.data().clientName,
+          service: doc.data().serviceName,
+          time: doc.data().startTime,
+          duration: doc.data().duration
+      }));
+      return `VERDICT: These are the ONLY appointments in the system: ${JSON.stringify(appointments)}. If an appointment is not in this list, it does not exist.`;
     },
 
     create_appointment: async (args) => {
       const requestedStart = args.startTime;
       const requestedDuration = parseInt(args.duration);
       const nowLocal = new Date(new Date().toLocaleString("en-US", { timeZone: timezone }));
-      if (new Date(requestedStart) < nowLocal) return "ERROR: Past dates forbidden.";
+      
+      if (new Date(requestedStart) < nowLocal) return "ERROR: CANNOT_BOOK_PAST_DATE";
+
       try {
         return await db.runTransaction(async (transaction) => {
           const appointmentsRef = db.collection("barbers").doc(barberId).collection("appointments");
           const snapshot = await transaction.get(appointmentsRef);
+          
           let conflictFound = false;
           snapshot.forEach(doc => {
             const existing = doc.data();
-            if (isOverlapping(requestedStart, requestedDuration, existing.startTime, existing.duration)) conflictFound = true;
+            if (isOverlapping(requestedStart, requestedDuration, existing.startTime, existing.duration)) {
+              conflictFound = true;
+            }
           });
-          if (conflictFound) return "ERROR: SLOT_OCCUPIED.";
+
+          if (conflictFound) return "ERROR: SLOT_JUST_OCCUPIED. Apologize to the client and offer another time.";
+
           const newDocRef = appointmentsRef.doc();
-          transaction.set(newDocRef, { ...args, source: 'ai_concierge', createdAt: new Date().toISOString(), status: 'scheduled' });
-          return "SUCCESS: Appointment confirmed.";
+          transaction.set(newDocRef, { 
+            ...args,
+            source: 'ai_concierge',
+            createdAt: new Date().toISOString(), 
+            status: 'scheduled' 
+          });
+
+          return "SUCCESS: Appointment confirmed in the database.";
         });
-      } catch (e) { return "ERROR: Sync failed."; }
+      } catch (e) { return "ERROR: System sync failed."; }
     },
 
     update_appointment: async (args) => {
@@ -76,13 +96,16 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
         return await db.runTransaction(async (transaction) => {
           const snapshot = await transaction.get(ref);
           const userDocs = await transaction.get(ref.where("clientName", "==", args.oldClientName));
-          if (userDocs.empty) return "ERROR: Not found.";
+          if (userDocs.empty) return "ERROR: Appointment not found in database.";
+          
           const targetDoc = userDocs.docs.sort((a, b) => b.data().startTime.localeCompare(a.data().startTime))[0];
+          
           let conflictFound = false;
           snapshot.forEach(doc => {
             if (doc.id !== targetDoc.id && isOverlapping(requestedStart, targetDoc.data().duration, doc.data().startTime, doc.data().duration)) conflictFound = true;
           });
-          if (conflictFound) return "ERROR: SLOT_OCCUPIED.";
+
+          if (conflictFound) return "ERROR: NEW_SLOT_OCCUPIED.";
           transaction.update(targetDoc.ref, { startTime: requestedStart, updatedAt: new Date().toISOString() });
           return "SUCCESS: Rescheduled.";
         });
@@ -96,7 +119,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
       const batch = db.batch();
       snapshot.docs.forEach(doc => batch.delete(doc.ref));
       await batch.commit();
-      return "SUCCESS: Removed.";
+      return "SUCCESS: Removed from database.";
     }
   };
 };
@@ -104,7 +127,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
 const toolsDeclaration = [
   { name: "save_client_identity", description: "Registers client name.", parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
   { name: "update_customer_data", description: "Saves CRM data.", parameters: { type: "object", properties: { preferences: { type: "string" }, notes: { type: "string" }, birthday: { type: "string" } } } },
-  { name: "get_realtime_agenda", description: "Checks busy slots." },
+  { name: "get_realtime_agenda", description: "Fetches current busy slots. USE THIS EVERY TIME the user asks about their status." },
   { name: "create_appointment", description: "Persists NEW booking.", parameters: { type: "object", properties: { clientName: { type: "string" }, serviceName: { type: "string" }, startTime: { type: "string" }, price: { type: "number" }, duration: { type: "number" }, notes: { type: "string" } }, required: ["clientName", "serviceName", "startTime", "price", "duration"] } },
   { name: "update_appointment", description: "Reschedules booking.", parameters: { type: "object", properties: { oldClientName: { type: "string" }, newStartTime: { type: "string" } }, required: ["oldClientName", "newStartTime"] } },
   { name: "delete_appointment", description: "Cancels booking.", parameters: { type: "object", properties: { clientName: { type: "string" } }, required: ["clientName"] } }
@@ -123,29 +146,26 @@ exports.processMessageWithAI = async ({
         const isVoiceMode = messageBody.includes("[PHONE CALL]");
         const userMessage = messageBody.replace(/\[PHONE CALL\]:|\[PHONE CALL CONTEXT\]:/g, "").trim();
 
-        // 1. HITL: INTERVENÇÃO HUMANA MANUAL
+        // 1. HITL: INTERVENÇÃO HUMANA
         const lowerMsg = userMessage.toLowerCase();
-        const needsHandoff = HUMAN_HANDOFF_KEYWORDS.some(k => lowerMsg.includes(k));
-
-        if (needsHandoff) {
-            const pausedMsg = targetLanguage.includes("Portuguese") 
-                ? "Entendido. Vou pedir para o profissional assumir agora. Só um instante! [PAUSE_AI]"
-                : "Understood. I'll have the professional take over right now. One moment! [PAUSE_AI]";
+        if (HUMAN_HANDOFF_KEYWORDS.some(k => lowerMsg.includes(k))) {
+            const pausedMsg = targetLanguage.includes("Portuguese") ? "Vou pedir para o profissional assumir agora. Só um instante! [PAUSE_AI]" : "I'll have the professional take over right now. [PAUSE_AI]";
             return pausedMsg;
         }
 
         const chatDoc = await chatRef.get();
         if (chatDoc.exists && chatDoc.data().status === 'paused') return null;
 
-        // --- 2. GROUNDING: INJEÇÃO DA FONTE DA VERDADE ---
+        // --- 2. GROUNDING REAL-TIME (FONTE DA VERDADE DIRETA DO FIRESTORE) ---
         const servicesSnap = await db.collection("barbers").doc(barberId).collection("services").get();
         const services = servicesSnap.docs.map(doc => doc.data());
         const technicalServicesContext = services.map(s => `- SERVICE_NAME: "${s.name}" | PRICE: ${s.price} | DURATION: ${s.duration} min`).join('\n');
 
+        // Busca agenda de hoje em diante para injetar no prompt (Evita alucinação de slots)
         const appointmentsSnap = await db.collection("barbers").doc(barberId).collection("appointments")
             .where("startTime", ">=", new Date().toISOString().split('T')[0])
             .get();
-        const busySlots = appointmentsSnap.docs.map(doc => `[BUSY] ${doc.data().startTime} (${doc.data().duration} min)`).join('\n');
+        const currentAgenda = appointmentsSnap.docs.map(doc => `- [BUSY] ${doc.data().startTime} (${doc.data().duration} min)`).join('\n');
 
         const timezone = barberTimezone || barberData.timezone || "America/New_York";
         const scheduler = getSchedulerContext(timezone);
@@ -154,32 +174,29 @@ exports.processMessageWithAI = async ({
         const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
         const openDaysText = workDays.map(d => dayNames[d]).join(", ");
 
-        // --- 3. MASTER PROMPT (CHECKLIST & ESCALATION) ---
+        // --- 3. MASTER PROMPT (CHECKLIST E VERIFICAÇÃO DE DISPONIBILIDADE) ---
         const MASTER_PROMPT = `
 You are Schedy AI, the Task-Oriented Concierge for "${barberData.barberShopName}".
-Language: ${targetLanguage}.
+Your mission: Identify Client -> Choose Service -> Verify Availability -> Finalize.
 
-DADOS REAIS DA AGENDA (SOURCE OF TRUTH):
-- Shop Time: ${scheduler.currentTimeLocal} | Date: ${scheduler.hojeLocalISO}
-- Open Hours: ${barberData.settings?.businessHours?.open} to ${barberData.settings?.businessHours?.close}
-- Working Days: ${openDaysText}
-- Services Available:
+--- REAL-TIME SOURCE OF TRUTH (TRUST THIS OVER HISTORY) ---
+- Current Shop Time: ${scheduler.currentTimeLocal} | Date: ${scheduler.hojeLocalISO}
+- Services:
 ${technicalServicesContext}
-- OCCUPIED SLOTS:
-${busySlots || "None."}
+- CURRENT OCCUPIED SLOTS (DO NOT OFFER THESE):
+${currentAgenda || "Agenda is completely empty."}
 
-CHECKLIST DE OBJETIVOS (RIGID FLOW):
-1. Identify Name (Current: ${clientName || "UNKNOWN"}).
-2. Choose Service (Strictly from the list above).
-3. Define Time (Only free slots).
+--- CRITICAL DATA INTEGRITY RULES ---
+1. DO NOT TRUST the conversation history for appointment status. If the professional deletes an appointment in the dashboard, it is GONE.
+2. If the user asks "Is it confirmed?", "Is it cancelled?" or "What time is my cut?", you MUST call 'get_realtime_agenda' to confirm.
+3. If 'get_realtime_agenda' doesn't show the user's name, their appointment was DELETED/CANCELLED by the barber. Inform them politely.
 
-ANTI-HALLUCINATION & ESCALATION RULES:
-- If info is missing from the SOURCE OF TRUTH, say you cannot confirm.
-- If the user is frustrated, angry, or asks for a person, say you will call the professional and append [PAUSE_AI].
-- If you cannot solve the request after 3 attempts, append [PAUSE_AI].
-- If user changes subject, pivot back: "I see! To move forward with your booking, what time do you prefer?"
+--- CHECKLIST ---
+1. Name (Current: ${clientName || "UNKNOWN"}).
+2. Service (Use EXACT Service Name).
+3. Time (Offer free slots between ${barberData.settings?.businessHours?.open} and ${barberData.settings?.businessHours?.close}).
 
-FINALIZATION:
+FINALIZATION TAG:
 When Nome, Service, Date, and Time are clear, append:
 [FINALIZAR_AGENDAMENTO: {"servico": "EXACT_NAME", "data": "YYYY-MM-DD", "hora": "HH:MM"}]
 `;
@@ -191,14 +208,14 @@ When Nome, Service, Date, and Time are clear, append:
         });
 
         let history = chatDoc.exists ? chatDoc.data().history : [];
-        const chat = model.startChat({ history: history.slice(-6) }); 
-        const finalInput = isInitialMessage ? `Greeting: Scanned QR for ${barberData.barberShopName}.` : userMessage;
+        const chat = model.startChat({ history: history.slice(-6) }); // Memória curta para foco na verdade atual
+        const finalInput = isInitialMessage ? `Greeting: Client scanned QR code for ${barberData.barberShopName}.` : userMessage;
 
         let result = await chat.sendMessage(finalInput); 
         let responseText = result.response.text();
         let calls = result.response.functionCalls();
 
-        // 4. CHAIN OF THOUGHT (Processamento de Ferramentas)
+        // 4. CHAIN OF THOUGHT (Processamento de Ferramentas com Try/Catch de Conflito)
         let errorCount = 0;
         while (calls && calls.length > 0) {
             const responses = [];
@@ -209,7 +226,7 @@ When Nome, Service, Date, and Time are clear, append:
                     responses.push({ functionResponse: { name: call.name, response: { content: toolResult } } });
                 } catch (e) {
                     errorCount++;
-                    responses.push({ functionResponse: { name: call.name, response: { content: "ERROR: Internal tool failure." } } });
+                    responses.push({ functionResponse: { name: call.name, response: { content: "ERROR: System lag. Try again." } } });
                 }
             }
             result = await chat.sendMessage(responses);
@@ -217,14 +234,10 @@ When Nome, Service, Date, and Time are clear, append:
             calls = result.response.functionCalls();
         }
 
-        // --- 5. LÓGICA DE PAUSA AUTOMÁTICA POR ERRO ---
-        if (errorCount >= 2) {
-            responseText += " [PAUSE_AI]";
-        }
-
+        if (errorCount >= 2) responseText += " [PAUSE_AI]";
         if (isVoiceMode) responseText = responseText.replace(/\*/g, '').replace(/#/g, '').trim();
 
-        // 6. PERSISTÊNCIA
+        // 5. PERSISTÊNCIA
         await chatRef.set({ 
             history: [...history, { role: "user", parts: [{ text: userMessage }] }, { role: "model", parts: [{ text: responseText }] }].slice(-20),
             lastMessage: userMessage, 
