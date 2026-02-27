@@ -12,7 +12,7 @@ const HUMAN_HANDOFF_KEYWORDS = [
 ];
 
 /**
- * Auxiliar: Verifica sobreposição de horários (Precisão Cirúrgica)
+ * Auxiliar: Verifica sobreposição de horários
  */
 const isOverlapping = (startA, durationA, startB, durationB) => {
   const aBegin = new Date(startA).getTime();
@@ -24,6 +24,7 @@ const isOverlapping = (startA, durationA, startB, durationB) => {
 
 /**
  * FÁBRICA DE FERRAMENTAS (Tools Factory)
+ * Responsável exclusivamente pela EXECUÇÃO de comandos validados.
  */
 const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
   return {
@@ -31,7 +32,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
       await mappingRef.update({ clientName: args.name });
       const customerRef = db.collection("barbers").doc(barberId).collection("customers").doc(fromNumber);
       await customerRef.set({ name: args.name, phone: fromNumber, updatedAt: new Date().toISOString() }, { merge: true });
-      return `SUCCESS: Identity saved as ${args.name}.`;
+      return `SUCCESS: Client name saved as ${args.name}.`;
     },
 
     update_customer_data: async (args) => {
@@ -41,52 +42,36 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
     },
     
     get_realtime_agenda: async () => {
-      // FORÇA LEITURA DIRETA DO FIRESTORE (SEM CACHE)
       const snap = await db.collection("barbers").doc(barberId).collection("appointments").get();
-      if (snap.empty) return "VERDICT: The agenda is currently EMPTY. All slots are available.";
-      
-      const appointments = snap.docs.map(doc => ({
-          client: doc.data().clientName,
-          service: doc.data().serviceName,
-          time: doc.data().startTime,
-          duration: doc.data().duration
-      }));
-      return `VERDICT: These are the ONLY appointments in the system: ${JSON.stringify(appointments)}. If an appointment is not in this list, it does not exist.`;
+      if (snap.empty) return "VERDICT: Database is EMPTY.";
+      const appointments = snap.docs.map(doc => ({ client: doc.data().clientName, service: doc.data().serviceName, time: doc.data().startTime, duration: doc.data().duration }));
+      return `VERDICT: Current actual bookings: ${JSON.stringify(appointments)}`;
     },
 
     create_appointment: async (args) => {
       const requestedStart = args.startTime;
       const requestedDuration = parseInt(args.duration);
       const nowLocal = new Date(new Date().toLocaleString("en-US", { timeZone: timezone }));
-      
-      if (new Date(requestedStart) < nowLocal) return "ERROR: CANNOT_BOOK_PAST_DATE";
+      if (new Date(requestedStart) < nowLocal) return "ERROR: PAST_DATE";
 
       try {
         return await db.runTransaction(async (transaction) => {
           const appointmentsRef = db.collection("barbers").doc(barberId).collection("appointments");
           const snapshot = await transaction.get(appointmentsRef);
-          
           let conflictFound = false;
           snapshot.forEach(doc => {
             const existing = doc.data();
-            if (isOverlapping(requestedStart, requestedDuration, existing.startTime, existing.duration)) {
+            if (existing.status !== 'CANCELLED' && isOverlapping(requestedStart, requestedDuration, existing.startTime, existing.duration)) {
               conflictFound = true;
             }
           });
-
-          if (conflictFound) return "ERROR: SLOT_JUST_OCCUPIED. Apologize to the client and offer another time.";
-
+          if (conflictFound) return "ERROR: SLOT_OCCUPIED.";
+          
           const newDocRef = appointmentsRef.doc();
-          transaction.set(newDocRef, { 
-            ...args,
-            source: 'ai_concierge',
-            createdAt: new Date().toISOString(), 
-            status: 'scheduled' 
-          });
-
-          return "SUCCESS: Appointment confirmed in the database.";
+          transaction.set(newDocRef, { ...args, source: 'ai_enterprise', createdAt: new Date().toISOString(), status: 'CONFIRMED' });
+          return "SUCCESS: APPOINTMENT_CREATED";
         });
-      } catch (e) { return "ERROR: System sync failed."; }
+      } catch (e) { return "ERROR: SYNC_FAIL"; }
     },
 
     update_appointment: async (args) => {
@@ -94,52 +79,41 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
       const ref = db.collection("barbers").doc(barberId).collection("appointments");
       try {
         return await db.runTransaction(async (transaction) => {
-          const snapshot = await transaction.get(ref);
-          const userDocs = await transaction.get(ref.where("clientName", "==", args.oldClientName));
-          if (userDocs.empty) return "ERROR: Appointment not found in database.";
-          
-          const targetDoc = userDocs.docs.sort((a, b) => b.data().startTime.localeCompare(a.data().startTime))[0];
-          
-          let conflictFound = false;
-          snapshot.forEach(doc => {
-            if (doc.id !== targetDoc.id && isOverlapping(requestedStart, targetDoc.data().duration, doc.data().startTime, doc.data().duration)) conflictFound = true;
-          });
-
-          if (conflictFound) return "ERROR: NEW_SLOT_OCCUPIED.";
+          const userDocs = await transaction.get(ref.where("clientPhone", "==", fromNumber).where("status", "==", "CONFIRMED"));
+          if (userDocs.empty) return "ERROR: NOT_FOUND";
+          const targetDoc = userDocs.docs[0];
           transaction.update(targetDoc.ref, { startTime: requestedStart, updatedAt: new Date().toISOString() });
-          return "SUCCESS: Rescheduled.";
+          return "SUCCESS: RESCHEDULED";
         });
-      } catch (e) { return "ERROR: Fail."; }
+      } catch (e) { return "ERROR: FAIL"; }
     },
 
     delete_appointment: async (args) => {
       const ref = db.collection("barbers").doc(barberId).collection("appointments");
-      const snapshot = await ref.where("clientName", "==", args.clientName).get();
-      if (snapshot.empty) return "ERROR: Not found.";
-      const batch = db.batch();
-      snapshot.docs.forEach(doc => batch.delete(doc.ref));
-      await batch.commit();
-      return "SUCCESS: Removed from database.";
+      const snapshot = await ref.where("clientPhone", "==", fromNumber).where("status", "==", "CONFIRMED").limit(1).get();
+      if (snapshot.empty) return "ERROR: NOT_FOUND";
+      await snapshot.docs[0].ref.update({ status: "CANCELLED", updatedAt: new Date().toISOString() });
+      return "SUCCESS: CANCELLED";
     }
   };
 };
 
 const toolsDeclaration = [
   { name: "save_client_identity", description: "Registers client name.", parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
-  { name: "update_customer_data", description: "Saves CRM data.", parameters: { type: "object", properties: { preferences: { type: "string" }, notes: { type: "string" }, birthday: { type: "string" } } } },
-  { name: "get_realtime_agenda", description: "Fetches current busy slots. USE THIS EVERY TIME the user asks about their status." },
-  { name: "create_appointment", description: "Persists NEW booking.", parameters: { type: "object", properties: { clientName: { type: "string" }, serviceName: { type: "string" }, startTime: { type: "string" }, price: { type: "number" }, duration: { type: "number" }, notes: { type: "string" } }, required: ["clientName", "serviceName", "startTime", "price", "duration"] } },
-  { name: "update_appointment", description: "Reschedules booking.", parameters: { type: "object", properties: { oldClientName: { type: "string" }, newStartTime: { type: "string" } }, required: ["oldClientName", "newStartTime"] } },
-  { name: "delete_appointment", description: "Cancels booking.", parameters: { type: "object", properties: { clientName: { type: "string" } }, required: ["clientName"] } }
+  { name: "update_customer_data", description: "Saves CRM data.", parameters: { type: "object", properties: { preferences: { type: "string" }, birthday: { type: "string" } } } },
+  { name: "get_realtime_agenda", description: "Mandatory check for busy slots." },
+  { name: "create_appointment", description: "Persists NEW booking.", parameters: { type: "object", properties: { clientName: { type: "string" }, serviceName: { type: "string" }, startTime: { type: "string" }, price: { type: "number" }, duration: { type: "number" } }, required: ["clientName", "serviceName", "startTime", "duration"] } },
+  { name: "update_appointment", description: "Changes booking time.", parameters: { type: "object", properties: { newStartTime: { type: "string" } }, required: ["newStartTime"] } },
+  { name: "delete_appointment", description: "Cancels booking." }
 ];
 
 /**
- * LÓGICA PRINCIPAL
+ * LÓGICA PRINCIPAL (LLM ISOLATION MODEL)
  */
 exports.processMessageWithAI = async ({ 
     barberId, barberData, clientName, messageBody, fromNumber, 
     isInitialMessage, db, mappingRef, globalAIConfig, targetLanguage,
-    barberTimezone, serverTimeISO 
+    barberTimezone, serverTimeISO, validatedBookingState 
 }) => {
     try {
         const chatRef = db.collection("barbers").doc(barberId).collection("chats").doc(fromNumber);
@@ -149,56 +123,53 @@ exports.processMessageWithAI = async ({
         // 1. HITL: INTERVENÇÃO HUMANA
         const lowerMsg = userMessage.toLowerCase();
         if (HUMAN_HANDOFF_KEYWORDS.some(k => lowerMsg.includes(k))) {
-            const pausedMsg = targetLanguage.includes("Portuguese") ? "Vou pedir para o profissional assumir agora. Só um instante! [PAUSE_AI]" : "I'll have the professional take over right now. [PAUSE_AI]";
-            return pausedMsg;
+            return "Entendido. Vou pedir para o profissional assumir agora. Só um instante! [PAUSE_AI]";
         }
 
-        const chatDoc = await chatRef.get();
-        if (chatDoc.exists && chatDoc.data().status === 'paused') return null;
-
-        // --- 2. GROUNDING REAL-TIME (FONTE DA VERDADE DIRETA DO FIRESTORE) ---
+        // --- 2. GROUNDING & ISOLATION (FONTE ÚNICA DE VERDADE) ---
         const servicesSnap = await db.collection("barbers").doc(barberId).collection("services").get();
-        const services = servicesSnap.docs.map(doc => doc.data());
-        const technicalServicesContext = services.map(s => `- SERVICE_NAME: "${s.name}" | PRICE: ${s.price} | DURATION: ${s.duration} min`).join('\n');
+        const techServices = servicesSnap.docs.map(doc => `- SERVICE: "${doc.data().name}" | PRICE: ${doc.data().price} | DURATION: ${doc.data().duration}`).join('\n');
 
-        // Busca agenda de hoje em diante para injetar no prompt (Evita alucinação de slots)
         const appointmentsSnap = await db.collection("barbers").doc(barberId).collection("appointments")
             .where("startTime", ">=", new Date().toISOString().split('T')[0])
-            .get();
-        const currentAgenda = appointmentsSnap.docs.map(doc => `- [BUSY] ${doc.data().startTime} (${doc.data().duration} min)`).join('\n');
+            .where("status", "==", "CONFIRMED").get();
+        const busySlots = appointmentsSnap.docs.map(doc => `[BUSY] ${doc.data().startTime}`).join('\n');
 
         const timezone = barberTimezone || barberData.timezone || "America/New_York";
         const scheduler = getSchedulerContext(timezone);
         const tools = setupTools(db, barberId, timezone, mappingRef, fromNumber);
-        const workDays = barberData.settings?.businessHours?.days || [1, 2, 3, 4, 5];
-        const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-        const openDaysText = workDays.map(d => dayNames[d]).join(", ");
 
-        // --- 3. MASTER PROMPT (CHECKLIST E VERIFICAÇÃO DE DISPONIBILIDADE) ---
+        // --- 3. MASTER PROMPT TRANSACIONAL ---
         const MASTER_PROMPT = `
-You are Schedy AI, the Task-Oriented Concierge for "${barberData.barberShopName}".
-Your mission: Identify Client -> Choose Service -> Verify Availability -> Finalize.
+You are Schedy AI, a DETERMINISTIC TRANSACTIONAL AGENT for "${barberData.barberShopName}".
+Your role is to transform Validated State into Natural Language.
 
---- REAL-TIME SOURCE OF TRUTH (TRUST THIS OVER HISTORY) ---
-- Current Shop Time: ${scheduler.currentTimeLocal} | Date: ${scheduler.hojeLocalISO}
-- Services:
-${technicalServicesContext}
-- CURRENT OCCUPIED SLOTS (DO NOT OFFER THESE):
-${currentAgenda || "Agenda is completely empty."}
+--- SINGLE SOURCE OF TRUTH (MANDATORY) ---
+CURRENT SYSTEM STATE FOR THIS CLIENT:
+- Appointment Exists: ${validatedBookingState.exists ? "YES" : "NO"}
+- Current State: ${validatedBookingState.state || "NONE"}
+- Details: ${validatedBookingState.exists ? JSON.stringify(validatedBookingState.data) : "N/A"}
 
---- CRITICAL DATA INTEGRITY RULES ---
-1. DO NOT TRUST the conversation history for appointment status. If the professional deletes an appointment in the dashboard, it is GONE.
-2. If the user asks "Is it confirmed?", "Is it cancelled?" or "What time is my cut?", you MUST call 'get_realtime_agenda' to confirm.
-3. If 'get_realtime_agenda' doesn't show the user's name, their appointment was DELETED/CANCELLED by the barber. Inform them politely.
+BUSINESS DATA:
+- Shop Time: ${scheduler.currentTimeLocal} | Date: ${scheduler.hojeLocalISO}
+- Services Available:
+${techServices}
+- OCCUPIED SLOTS (DO NOT OFFER):
+${busySlots || "None."}
 
---- CHECKLIST ---
-1. Name (Current: ${clientName || "UNKNOWN"}).
-2. Service (Use EXACT Service Name).
-3. Time (Offer free slots between ${barberData.settings?.businessHours?.open} and ${barberData.settings?.businessHours?.close}).
+--- ANTI-HALLUCINATION PROTOCOL ---
+1. DO NOT trust conversation history for booking status. Use only "CURRENT SYSTEM STATE" above.
+2. If CURRENT SYSTEM STATE says "Appointment Exists: NO", you MUST NOT claim the user has a booking.
+3. If user asks to cancel but state is NONE, inform they have no active booking.
+4. TRANSITIONS: Only suggest transitions valid for the Current State. (NONE -> CONFIRMED, CONFIRMED -> CANCELLED).
 
-FINALIZATION TAG:
-When Nome, Service, Date, and Time are clear, append:
-[FINALIZAR_AGENDAMENTO: {"servico": "EXACT_NAME", "data": "YYYY-MM-DD", "hora": "HH:MM"}]
+--- WORKFLOW ---
+1. Identify Name (Current: ${clientName || "UNKNOWN"}).
+2. Collect Service -> Collect Time -> Summary -> [FINALIZAR_AGENDAMENTO]
+3. If user changes subject, respond briefly and pivot back to the checklist.
+
+Language: ${targetLanguage}.
+${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
 `;
 
         const model = genAI.getGenerativeModel({ 
@@ -207,15 +178,15 @@ When Nome, Service, Date, and Time are clear, append:
             tools: [{ functionDeclarations: toolsDeclaration }] 
         });
 
-        let history = chatDoc.exists ? chatDoc.data().history : [];
-        const chat = model.startChat({ history: history.slice(-6) }); // Memória curta para foco na verdade atual
-        const finalInput = isInitialMessage ? `Greeting: Client scanned QR code for ${barberData.barberShopName}.` : userMessage;
+        let history = (await chatRef.get()).data()?.history || [];
+        const chat = model.startChat({ history: history.slice(-6) }); 
+        const finalInput = isInitialMessage ? `Greeting: Client scanned QR for ${barberData.barberShopName}.` : userMessage;
 
         let result = await chat.sendMessage(finalInput); 
         let responseText = result.response.text();
         let calls = result.response.functionCalls();
 
-        // 4. CHAIN OF THOUGHT (Processamento de Ferramentas com Try/Catch de Conflito)
+        // 4. CHAIN OF THOUGHT (Execution Layer)
         let errorCount = 0;
         while (calls && calls.length > 0) {
             const responses = [];
@@ -226,7 +197,7 @@ When Nome, Service, Date, and Time are clear, append:
                     responses.push({ functionResponse: { name: call.name, response: { content: toolResult } } });
                 } catch (e) {
                     errorCount++;
-                    responses.push({ functionResponse: { name: call.name, response: { content: "ERROR: System lag. Try again." } } });
+                    responses.push({ functionResponse: { name: call.name, response: { content: "SYSTEM_ERROR" } } });
                 }
             }
             result = await chat.sendMessage(responses);
@@ -247,7 +218,7 @@ When Nome, Service, Date, and Time are clear, append:
         return responseText;
 
     } catch (error) {
-        console.error("AI ERROR:", error);
-        return "Internal sync issue. Please try again. [PAUSE_AI]";
+        console.error("LLM ISOLATION ERROR:", error);
+        return "Estou com dificuldade em sincronizar a agenda. Vou pedir para o barbeiro confirmar manualmente. [PAUSE_AI]";
     }
 };
