@@ -24,7 +24,7 @@ const isOverlapping = (startA, durationA, startB, durationB) => {
 
 /**
  * FÁBRICA DE FERRAMENTAS (Tools Factory)
- * Responsável exclusivamente pela EXECUÇÃO de comandos validados.
+ * MANTIDO: Lógica transacional determinística.
  */
 const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
   return {
@@ -100,7 +100,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
 
 const toolsDeclaration = [
   { name: "save_client_identity", description: "Registers client name.", parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
-  { name: "update_customer_data", description: "Saves CRM data.", parameters: { type: "object", properties: { preferences: { type: "string" }, birthday: { type: "string" } } } },
+  { name: "update_customer_data", description: "Saves CRM data.", parameters: { type: "object", properties: { preferences: { type: "string" }, notes: { type: "string" }, birthday: { type: "string" } } } },
   { name: "get_realtime_agenda", description: "Mandatory check for busy slots." },
   { name: "create_appointment", description: "Persists NEW booking.", parameters: { type: "object", properties: { clientName: { type: "string" }, serviceName: { type: "string" }, startTime: { type: "string" }, price: { type: "number" }, duration: { type: "number" } }, required: ["clientName", "serviceName", "startTime", "duration"] } },
   { name: "update_appointment", description: "Changes booking time.", parameters: { type: "object", properties: { newStartTime: { type: "string" } }, required: ["newStartTime"] } },
@@ -108,7 +108,32 @@ const toolsDeclaration = [
 ];
 
 /**
- * LÓGICA PRINCIPAL (LLM ISOLATION MODEL)
+ * FUNÇÃO AUXILIAR DE RETENTATIVA (Exponential Backoff Lite)
+ * Resolve erros 503 e sobrecarga da API do Google.
+ */
+const sendMessageWithRetry = async (chat, message, retries = 2) => {
+    for (let i = 0; i <= retries; i++) {
+        try {
+            return await chat.sendMessage(message);
+        } catch (error) {
+            const isTransient = error.message.includes("503") || 
+                                error.message.includes("500") || 
+                                error.message.includes("overloaded") ||
+                                error.message.includes("Service Unavailable");
+            
+            if (isTransient && i < retries) {
+                const delay = 1000 * (i + 1); // 1s, depois 2s
+                console.warn(`[AI_RETRY] Gemini indisponível (Tentativa ${i + 1}). Aguardando ${delay}ms...`);
+                await new Promise(res => setTimeout(res, delay));
+                continue;
+            }
+            throw error; // Erro fatal ou esgotou tentativas
+        }
+    }
+};
+
+/**
+ * LÓGICA PRINCIPAL (LLM ISOLATION + RESILIÊNCIA)
  */
 exports.processMessageWithAI = async ({ 
     barberId, barberData, clientName, messageBody, fromNumber, 
@@ -182,11 +207,12 @@ ${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
         const chat = model.startChat({ history: history.slice(-6) }); 
         const finalInput = isInitialMessage ? `Greeting: Client scanned QR for ${barberData.barberShopName}.` : userMessage;
 
-        let result = await chat.sendMessage(finalInput); 
+        // EXECUÇÃO COM RESILIÊNCIA (RETRY)
+        let result = await sendMessageWithRetry(chat, finalInput); 
         let responseText = result.response.text();
         let calls = result.response.functionCalls();
 
-        // 4. CHAIN OF THOUGHT (Execution Layer)
+        // 4. CHAIN OF THOUGHT (Execution Layer com Retry)
         let errorCount = 0;
         while (calls && calls.length > 0) {
             const responses = [];
@@ -200,7 +226,8 @@ ${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
                     responses.push({ functionResponse: { name: call.name, response: { content: "SYSTEM_ERROR" } } });
                 }
             }
-            result = await chat.sendMessage(responses);
+            // Executa resposta da ferramenta com Retry
+            result = await sendMessageWithRetry(chat, responses);
             responseText = result.response.text();
             calls = result.response.functionCalls();
         }
@@ -218,7 +245,8 @@ ${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
         return responseText;
 
     } catch (error) {
-        console.error("LLM ISOLATION ERROR:", error);
-        return "Estou com dificuldade em sincronizar a agenda. Vou pedir para o barbeiro confirmar manualmente. [PAUSE_AI]";
+        console.error("CRITICAL AI ERROR:", error);
+        // Fallback resiliente em caso de falha persistente do Google
+        return "Tive um pequeno problema técnico ao consultar minha agenda. Por favor, tente novamente em alguns segundos. 🤖";
     }
 };
