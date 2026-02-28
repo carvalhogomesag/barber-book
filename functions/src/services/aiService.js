@@ -31,7 +31,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
       await mappingRef.update({ clientName: args.name });
       const customerRef = db.collection("barbers").doc(barberId).collection("customers").doc(fromNumber);
       await customerRef.set({ name: args.name, phone: fromNumber, updatedAt: new Date().toISOString() }, { merge: true });
-      return `SUCCESS: Identity saved as ${args.name}.`;
+      return `SUCCESS: Client name saved as ${args.name}.`;
     },
 
     update_customer_data: async (args) => {
@@ -41,7 +41,6 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
     },
     
     get_realtime_agenda: async () => {
-      // BUSCA TODOS OS STATUS ATIVOS (Dashboard + IA)
       const snap = await db.collection("barbers").doc(barberId).collection("appointments")
         .where("status", "in", ["CONFIRMED", "scheduled", "PENDING"])
         .get();
@@ -53,7 +52,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
         time: doc.data().startTime, 
         duration: doc.data().duration 
       }));
-      return `VERDICT: Current actual bookings: ${JSON.stringify(appointments)}`;
+      return `VERDICT: Current actual bookings in system: ${JSON.stringify(appointments)}`;
     },
 
     create_appointment: async (args) => {
@@ -69,7 +68,6 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
           let conflictFound = false;
           snapshot.forEach(doc => {
             const existing = doc.data();
-            // Verifica conflito contra qualquer agendamento não-cancelado
             if (existing.status !== 'CANCELLED' && isOverlapping(requestedStart, requestedDuration, existing.startTime, existing.duration)) {
               conflictFound = true;
             }
@@ -77,7 +75,6 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
           if (conflictFound) return "ERROR: SLOT_OCCUPIED.";
           
           const newDocRef = appointmentsRef.doc();
-          // Gravamos como 'scheduled' para compatibilidade total com o Dashboard visual
           transaction.set(newDocRef, { ...args, source: 'ai_enterprise', createdAt: new Date().toISOString(), status: 'scheduled' });
           return "SUCCESS: APPOINTMENT_CREATED";
         });
@@ -89,7 +86,6 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
       const ref = db.collection("barbers").doc(barberId).collection("appointments");
       try {
         return await db.runTransaction(async (transaction) => {
-          // Busca agendamentos ativos para este cliente
           const userDocs = await transaction.get(
             ref.where("clientPhone", "==", fromNumber)
                .where("status", "in", ["CONFIRMED", "scheduled"])
@@ -141,7 +137,7 @@ const sendMessageWithRetry = async (chat, message, retries = 2) => {
 };
 
 /**
- * LÓGICA PRINCIPAL (REFINADA: HARMONIZAÇÃO DASHBOARD + IA)
+ * LÓGICA PRINCIPAL (REFINADA: PROTOCOLO 4 PILARES + GROUNDING DE FOLGAS)
  */
 exports.processMessageWithAI = async ({ 
     barberId, barberData, clientName, messageBody, fromNumber, 
@@ -154,67 +150,72 @@ exports.processMessageWithAI = async ({
         const userMessage = messageBody.replace(/\[PHONE CALL\]:|\[PHONE CALL CONTEXT\]:/g, "").trim();
 
         // 1. HITL: INTERVENÇÃO HUMANA
-        const lowerMsg = userMessage.toLowerCase();
-        if (HUMAN_HANDOFF_KEYWORDS.some(k => lowerMsg.includes(k))) {
+        if (HUMAN_HANDOFF_KEYWORDS.some(k => userMessage.toLowerCase().includes(k))) {
             return "Entendido. Vou pedir para o profissional assumir agora. Só um instante! [PAUSE_AI]";
         }
 
         const chatDoc = await chatRef.get();
         if (chatDoc.exists && chatDoc.data().status === 'paused') return null;
 
-        // --- 2. GROUNDING (FONTE ÚNICA DE VERDADE) ---
+        // --- 2. GROUNDING (SERVIÇOS + AGENDA + FOLGAS) ---
         const servicesSnap = await db.collection("barbers").doc(barberId).collection("services").get();
-        const techServices = servicesSnap.docs.map(doc => `- SERVICE: "${doc.data().name}" | PRICE: ${doc.data().price} | DURATION: ${doc.data().duration}`).join('\n');
+        const techServices = servicesSnap.docs.map(doc => `- SERVICE: "${doc.data().name}" | PRICE: ${doc.data().price} | DURATION: ${doc.data().duration} min`).join('\n');
 
-        // BUSCA TODOS OS AGENDAMENTOS ATIVOS (Incluindo os do Dashboard 'scheduled')
         const activeStatusList = ["CONFIRMED", "scheduled", "PENDING"];
         const appointmentsSnap = await db.collection("barbers").doc(barberId).collection("appointments")
             .where("startTime", ">=", new Date().toISOString().split('T')[0])
             .where("status", "in", activeStatusList).get();
         
         let busySlotsList = appointmentsSnap.docs.map(doc => `[OCUPADO] ${doc.data().startTime}`);
-
-        // --- INJEÇÃO DO BREAK TIME COMO SLOT OCUPADO ---
         const breakTime = barberData.settings?.businessHours?.break; 
         if (breakTime && breakTime !== "None") {
-            busySlotsList.push(`[OCUPADO/BREAK] Todos os dias entre ${breakTime.replace('-', ' e ')} (Pausa para almoço/descanso)`);
+            busySlotsList.push(`[OCUPADO/PAUSA] Todos os dias entre ${breakTime.replace('-', ' e ')}`);
         }
         const busySlotsString = busySlotsList.join('\n');
 
         const timezone = barberTimezone || barberData.timezone || "America/New_York";
         const scheduler = getSchedulerContext(timezone);
         const tools = setupTools(db, barberId, timezone, mappingRef, fromNumber);
+        
+        // Validação Rígida de Dias de Trabalho (Off-Day Shield)
+        const workDays = barberData.settings?.businessHours?.days || [1, 2, 3, 4, 5];
+        const validatedDateMenu = scheduler.dateMenu.map(d => {
+            const isOpen = workDays.includes(d.dayOfWeek);
+            return `${d.option}) ${d.label} (${d.iso}) - Status: ${isOpen ? '[ABERTO]' : '[FECHADO/FOLGA - NÃO AGENDAR]'}`;
+        }).join('\n');
 
-        // --- 3. MASTER PROMPT TRANSACIONAL ---
+        // --- 3. MASTER PROMPT TRANSACIONAL (PROTOCOLO 4 PILARES) ---
         const MASTER_PROMPT = `
-You are Schedy AI, a DETERMINISTIC TRANSACTIONAL AGENT for "${barberData.barberShopName}".
-Your role: Transform Validated State into Natural Language.
+You are Schedy AI, the deterministic concierge for "${barberData.barberShopName}".
+Your mission is to fulfill a 4-pillar booking form before confirming any action.
 
---- SINGLE SOURCE OF TRUTH (MANDATORY) ---
-CURRENT SYSTEM STATE FOR THIS CLIENT:
-- Appointment Exists in DB: ${validatedBookingState.exists ? "YES" : "NO"}
-- Current State: ${validatedBookingState.state || "NONE"}
-- Details: ${validatedBookingState.exists ? JSON.stringify(validatedBookingState.data) : "N/A"}
+--- THE 4 MANDATORY PILLARS ---
+1. CLIENT NAME: ${clientName || "Unknown"} (Ask if unknown).
+2. SERVICE TYPE: Strictly from the list below.
+3. DATE: Strictly from the [ABERTO] dates below.
+4. TIME: Strictly free slots during business hours.
 
-BUSINESS DATA:
-- Shop Time: ${scheduler.currentTimeLocal} | Date: ${scheduler.hojeLocalISO}
-- Open Hours: ${barberData.settings?.businessHours?.open} to ${barberData.settings?.businessHours?.close}
-- BREAK TIME: ${breakTime || "None"}
-- OCCUPIED SLOTS (DO NOT OFFER):
+--- BUSINESS CALENDAR (SINGLE SOURCE OF TRUTH) ---
+Current Local Time: ${scheduler.currentTimeLocal} | Today: ${scheduler.hojeLocalISO}
+
+Available Dates (Only suggest [ABERTO] days):
+${validatedDateMenu}
+
+Business Hours: ${barberData.settings?.businessHours?.open} to ${barberData.settings?.businessHours?.close}
+Occupied/Blocked Slots (DO NOT OFFER):
 ${busySlotsString || "None."}
 
---- ANTI-HALLUCINATION RULES ---
-1. TRUTH OVER HISTORY: Even if you said a slot was free, if it is now [OCUPADO] or [BREAK], you MUST explicitly apologize and say it was just taken.
-2. DO NOT trust conversation history for booking status. Use only "CURRENT SYSTEM STATE" above.
-3. TRANSITIONS: NONE -> CONFIRMED, CONFIRMED -> CANCELLED.
-4. INTELLIGENCE: "1030" is 10:30, "17" is 17:00.
+--- SERVICES ---
+${techServices}
 
---- WORKFLOW ---
-1. Identify Name (Current: ${clientName || "UNKNOWN"}).
-2. Collect Service -> Collect Time -> Summary -> [FINALIZAR_AGENDAMENTO]
+--- DATA INTEGRITY PROTOCOL ---
+1. DAY OFF RULE: If a user asks for a [FECHADO/FOLGA] date, you MUST politely state the shop is closed and suggest the next [ABERTO] day.
+2. TRUTH OVER HISTORY: Use only "CURRENT SYSTEM STATE" for booking status.
+3. CONFIRMATION: When all 4 pillars are clear, you MUST present a final summary and ask: "Can I confirm [SERVICE] for [NAME] on [DATE] at [TIME]?".
+4. EXECUTION: Only call 'create_appointment' AFTER the user explicitly says "Yes" or "Confirm".
 
 Language: ${targetLanguage}.
-${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
+${isVoiceMode ? "- VOICE MODE: Very short phrases, natural spoken dates." : ""}
 `;
 
         const model = genAI.getGenerativeModel({ 
@@ -265,6 +266,6 @@ ${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
 
     } catch (error) {
         console.error("LLM ISOLATION ERROR:", error);
-        return "Estou com dificuldade em sincronizar a agenda. Vou pedir para o barbeiro confirmar manualmente. [PAUSE_AI]";
+        return "Estou com dificuldade em sincronizar a agenda agora. Vou pedir para o barbeiro confirmar manualmente. [PAUSE_AI]";
     }
 };
