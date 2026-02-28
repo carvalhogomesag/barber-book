@@ -1,6 +1,7 @@
 /**
  * functions/src/services/aiService.js
  * Orquestrador Principal do LLM (Clean Architecture)
+ * Versão: 2.1 - Fix: Object Return & Tool Success Tracking
  */
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { GEMINI_API_KEY, GEMINI_MODEL } = require("../../config"); 
@@ -41,9 +42,12 @@ exports.processMessageWithAI = async ({
 
         // 1. HITL (Human in the Loop)
         if (HUMAN_HANDOFF_KEYWORDS.some(k => userMessage.toLowerCase().includes(k))) {
-            return isVoiceMode 
-              ? "Entendido. Vou transferir para o profissional. [PAUSE_AI]" 
-              : "Entendido. Vou pedir para o profissional assumir agora. Só um instante! [PAUSE_AI]";
+            return {
+                responseText: isVoiceMode 
+                  ? "Entendido. Vou transferir para o profissional. [PAUSE_AI]" 
+                  : "Entendido. Vou pedir para o profissional assumir agora. Só um instante! [PAUSE_AI]",
+                toolExecuted: false
+            };
         }
 
         const chatDoc = await chatRef.get();
@@ -66,13 +70,15 @@ exports.processMessageWithAI = async ({
         }));
 
         const timezone = barberTimezone || barberData.timezone || "America/New_York";
-        const scheduler = getSchedulerContext(timezone);
+        
+        // Passamos barberData para o scheduler gerar os "Golden Slots"
+        const scheduler = getSchedulerContext(timezone, barberData);
         const tools = setupTools(db, barberId, timezone, mappingRef, fromNumber);
 
         // 3. CONSTRUÇÃO DO PROMPT
         const finalPrompt = buildMasterPrompt({
             barberData, clientName, scheduler, techServices, 
-            userCurrentAppointments, // INJEÇÃO DA VERDADE
+            userCurrentAppointments, 
             targetLanguage, isVoiceMode, globalAIConfig
         });
 
@@ -83,7 +89,6 @@ exports.processMessageWithAI = async ({
             tools:[{ functionDeclarations: toolsDeclaration }] 
         });
 
-        // HISTÓRICO APENAS TEXTUAL (A Injeção de estado acima resolve a falta de metadados das funções)
         let history = (await chatRef.get()).data()?.history ||[];
         const chat = model.startChat({ history: history.slice(-6) }); 
         const finalInput = isInitialMessage ? `Greeting: Scanned QR for ${barberData.barberShopName}.` : userMessage;
@@ -92,6 +97,7 @@ exports.processMessageWithAI = async ({
         let result = await sendMessageWithRetry(chat, finalInput); 
         let responseText = result.response.text();
         let calls = result.response.functionCalls();
+        let toolExecuted = false; // Rastreador de sucesso para reset do Governor
 
         while (calls && calls.length > 0) {
             const responses =[];
@@ -99,6 +105,11 @@ exports.processMessageWithAI = async ({
                 try {
                     const toolResult = await tools[call.name](call.args);
                     responses.push({ functionResponse: { name: call.name, response: { content: toolResult } } });
+                    
+                    // Se uma ferramenta produtiva retornou sucesso, sinalizamos para o controlador
+                    if (toolResult.includes("SUCCESS") && (call.name.includes("appointment") || call.name === "save_client_identity")) {
+                        toolExecuted = true;
+                    }
                 } catch (e) {
                     responses.push({ functionResponse: { name: call.name, response: { content: "SYSTEM_ERROR" } } });
                 }
@@ -121,10 +132,14 @@ exports.processMessageWithAI = async ({
             updatedAt: new Date().toISOString()
         }, { merge: true });
 
-        return responseText;
+        // RETORNO EM OBJETO (Obrigatório para o WebhookController)
+        return { responseText, toolExecuted };
 
     } catch (error) {
         console.error("CRITICAL AI ERROR:", error);
-        return "Estou com dificuldade em acessar a agenda agora. Pode repetir o seu pedido? 🤖";
+        return { 
+            responseText: "Estou com dificuldade em acessar a agenda agora. Pode repetir o seu pedido? 🤖", 
+            toolExecuted: false 
+        };
     }
 };
