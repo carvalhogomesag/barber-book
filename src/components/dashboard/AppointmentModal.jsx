@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Modal } from '../ui/Modal';
 import { Input } from '../ui/Input';
 import { Button } from '../ui/Button';
-import { CheckSquare, Square, Clock, StickyNote, Trash2 } from 'lucide-react';
+import { CheckSquare, Clock, StickyNote, Trash2, Calendar as CalIcon } from 'lucide-react';
 import { format } from 'date-fns';
 
 export function AppointmentModal({ 
@@ -22,7 +22,6 @@ export function AppointmentModal({
   const [notes, setNotes] = useState('');
   const [formDate, setFormDate] = useState(new Date());
 
-  // Sincroniza os campos quando o modal abre para editar ou criar
   useEffect(() => {
     if (isOpen) {
       if (editingAppointment) {
@@ -49,97 +48,146 @@ export function AppointmentModal({
     );
   };
 
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    onSave({
-      clientName,
-      selectedServiceIds,
-      time,
-      notes,
-      formDate
-    });
-  };
+  const totalDuration = services
+    .filter(s => selectedServiceIds.includes(s.id))
+    .reduce((acc, s) => acc + s.duration, 0);
+
+  const totalPrice = services
+    .filter(s => selectedServiceIds.includes(s.id))
+    .reduce((acc, s) => acc + s.price, 0);
+
+  // FOOTER FIXO: Ações sempre visíveis no rodapé do modal
+  const modalFooter = (
+    <div className="flex items-center justify-between gap-4 w-full">
+      {editingAppointment ? (
+        <button 
+          type="button" 
+          onClick={() => onDelete(editingAppointment.id)} 
+          className="flex items-center gap-2 px-6 h-14 bg-red-50 text-schedy-danger rounded-2xl font-black uppercase text-[10px] tracking-widest hover:bg-schedy-danger hover:text-white transition-all"
+        >
+          <Trash2 size={18} /> Delete Appointment
+        </button>
+      ) : (
+        <div className="flex flex-col">
+            <span className="text-[9px] font-black uppercase text-schedy-gray tracking-widest">Total Estimate</span>
+            <span className="text-2xl font-black text-schedy-black italic">{currency}{totalPrice}</span>
+        </div>
+      )}
+      
+      <Button 
+        onClick={(e) => {
+            e.preventDefault();
+            onSave({ clientName, selectedServiceIds, time, notes, formDate });
+        }} 
+        loading={loading} 
+        className="flex-1 max-w-[260px] h-14 shadow-vivid"
+      >
+        {editingAppointment ? "UPDATE BOOKING" : "CONFIRM BOOKING"}
+      </Button>
+    </div>
+  );
 
   return (
-    <Modal isOpen={isOpen} onClose={onClose} title={editingAppointment ? "Edit Appointment" : "New Appointment"}>
-      <form onSubmit={handleSubmit} className="flex flex-col gap-4 md:gap-5">
-        <div className="flex flex-col gap-1">
-          <label className="text-[10px] text-barber-gray font-black uppercase tracking-widest italic">Appointment Date</label>
-          <input 
-            type="date" 
-            value={format(formDate, 'yyyy-MM-dd')}
-            onChange={(e) => {
-              const [year, month, day] = e.target.value.split('-').map(Number);
-              setFormDate(new Date(year, month - 1, day));
-            }}
-            className="bg-barber-black border border-zinc-800 rounded-lg p-3 text-sm text-white focus:outline-none focus:border-barber-gold transition-colors"
+    <Modal 
+      isOpen={isOpen} 
+      onClose={onClose} 
+      title={editingAppointment ? "Manage Appointment" : "New Direct Booking"}
+      footer={modalFooter}
+    >
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-x-12 gap-y-8">
+        
+        {/* COLUNA ESQUERDA: CLIENTE E SERVIÇOS */}
+        <div className="space-y-6">
+          <Input 
+            label="Client Name" 
+            placeholder="Search or type name..." 
+            value={clientName} 
+            onChange={e => setClientName(e.target.value)} 
             required 
           />
-        </div>
-
-        <Input label="CLIENT NAME" placeholder="Ex: John Doe" value={clientName} onChange={e => setClientName(e.target.value)} required />
-        
-        <div className="w-full">
-          <label className="text-[10px] text-barber-gray font-black uppercase mb-2 block tracking-widest italic">Select Services (Combo)</label>
-          <div className="grid grid-cols-1 gap-2 max-h-40 md:max-h-44 overflow-y-auto pr-2 custom-scrollbar">
-            {services.map(service => {
-              const isSelected = selectedServiceIds.includes(service.id);
-              return (
-                <button
-                  key={service.id}
-                  type="button"
-                  onClick={() => toggleService(service.id)}
-                  className={`flex items-center justify-between p-3 rounded-xl border transition-all duration-200 ${
-                    isSelected ? 'bg-barber-gold/20 border-barber-gold text-barber-gold' : 'bg-zinc-900/50 border-zinc-800 text-zinc-400 hover:border-zinc-700'
-                  }`}
-                >
-                  <div className="flex items-center gap-3 text-left">
-                    {isSelected ? <CheckSquare size={18} /> : <Square size={18} />}
-                    <span className="text-sm font-bold uppercase tracking-tight">{service.name}</span>
-                  </div>
-                  <span className="text-xs font-black">{currency}{service.price}</span>
-                </button>
-              );
-            })}
+          
+          <div className="space-y-3">
+            {/* CORREÇÃO AQUI: Removido 'block' onde existia 'flex' */}
+            <label className="text-[10px] text-schedy-gray font-black uppercase tracking-widest flex items-center gap-2 ml-1">
+              Select Services (Combo)
+            </label>
+            <div className="space-y-2 max-h-[280px] overflow-y-auto pr-2 custom-scrollbar">
+              {services.map(service => {
+                const isSelected = selectedServiceIds.includes(service.id);
+                return (
+                  <button
+                    key={service.id}
+                    type="button"
+                    onClick={() => toggleService(service.id)}
+                    className={`
+                        w-full flex items-center justify-between p-4 rounded-2xl border-2 transition-all
+                        ${isSelected 
+                            ? `border-service-${service.color} bg-service-${service.color}/5 text-schedy-black` 
+                            : 'border-schedy-canvas bg-schedy-canvas/30 text-schedy-gray hover:border-schedy-border'}
+                    `}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center transition-colors ${isSelected ? `bg-service-${service.color} border-service-${service.color}` : 'border-schedy-border bg-white'}`}>
+                        {isSelected && <CheckSquare size={14} className="text-white" />}
+                      </div>
+                      <span className="text-[11px] font-black uppercase italic tracking-tight">{service.name}</span>
+                    </div>
+                    <span className="text-xs font-black tabular-nums">{currency}{service.price}</span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-4">
-          <Input label="TIME" type="time" value={time} onChange={e => setTime(e.target.value)} required />
-          <div className="flex flex-col justify-end pb-1 px-1">
-             <span className="text-[10px] text-zinc-500 uppercase font-black tracking-widest italic">Duration</span>
-             <div className="flex items-center gap-1.5 text-barber-gold font-bold">
-                <Clock size={14} />
-                <span className="text-sm">
-                  {services.filter(s => selectedServiceIds.includes(s.id)).reduce((acc, s) => acc + s.duration, 0)} min
-                </span>
+        {/* COLUNA DIREITA: DATA, HORA E NOTAS */}
+        <div className="space-y-6">
+          <div className="space-y-6">
+             <div className="space-y-2">
+                <label className="text-[10px] text-schedy-gray font-black uppercase tracking-widest flex items-center gap-2 ml-1">
+                  <CalIcon size={12} /> Appointment Date
+                </label>
+                <div className="relative">
+                    <input 
+                        type="date" 
+                        value={format(formDate, 'yyyy-MM-dd')}
+                        onChange={(e) => {
+                            const [year, month, day] = e.target.value.split('-').map(Number);
+                            setFormDate(new Date(year, month - 1, day));
+                        }}
+                        className="w-full bg-schedy-canvas border-2 border-schedy-border rounded-2xl p-4 text-schedy-black font-bold text-sm outline-none focus:border-schedy-black transition-all"
+                        required 
+                    />
+                </div>
+             </div>
+
+             <div className="grid grid-cols-2 gap-4">
+                <Input label="Time" type="time" value={time} onChange={e => setTime(e.target.value)} required />
+                <div className="bg-schedy-canvas/50 rounded-2xl p-4 flex flex-col justify-center border border-schedy-border/50">
+                    <label className="text-[9px] text-schedy-gray font-black uppercase tracking-widest leading-none mb-1">Duration</label>
+                    <div className="flex items-center gap-2 text-schedy-black">
+                        <Clock size={14} />
+                        <span className="text-sm font-black italic">{totalDuration} MIN</span>
+                    </div>
+                </div>
              </div>
           </div>
+
+          <div className="space-y-2">
+            {/* CORREÇÃO AQUI: Removido 'block' onde existia 'flex' */}
+            <label className="text-[10px] text-schedy-gray font-black uppercase tracking-widest flex items-center gap-2 ml-1">
+              <StickyNote size={12} /> Notes
+            </label>
+            <textarea 
+              value={notes}
+              onChange={e => setNotes(e.target.value)}
+              placeholder="Any special requests..."
+              className="w-full bg-schedy-canvas border-2 border-schedy-border rounded-2xl p-4 text-sm font-bold text-schedy-black outline-none focus:border-schedy-black transition-all min-h-[100px] resize-none placeholder:text-schedy-gray/30"
+            />
+          </div>
         </div>
 
-        <div className="flex flex-col gap-1">
-          <label className="text-[10px] text-barber-gray font-black uppercase mb-1 flex items-center gap-1 tracking-widest italic">
-            <StickyNote size={12} className="text-barber-gold" /> Notes
-          </label>
-          <textarea 
-            value={notes}
-            onChange={e => setNotes(e.target.value)}
-            placeholder="Special requests..."
-            className="bg-barber-black border border-zinc-800 rounded-lg p-3 text-sm text-white focus:outline-none focus:border-barber-gold transition-colors min-h-[60px] resize-none"
-          />
-        </div>
-
-        <div className="flex gap-2 mt-2 pt-4 border-t border-zinc-800">
-          {editingAppointment && (
-            <button type="button" onClick={() => onDelete(editingAppointment.id)} className="bg-zinc-800 text-red-500 px-4 rounded-xl hover:bg-red-500/20 transition-all border border-transparent hover:border-red-500/50">
-              <Trash2 size={20} />
-            </button>
-          )}
-          <Button type="submit" loading={loading} className="flex-1 h-12 md:h-14 text-base md:text-lg font-black uppercase tracking-tighter italic">
-            {editingAppointment ? "UPDATE" : "CONFIRM"}
-          </Button>
-        </div>
-      </form>
+      </div>
     </Modal>
   );
 }

@@ -1,18 +1,32 @@
 import React from 'react';
 
-// Este componente aceita:
-// - children: o texto dentro do botão
-// - variant: 'primary' (vermelho) ou 'outline' (borda dourada)
-// - loading: se for true, mostra "Carregando..." e desabilita
-// - ...props: qualquer outra coisa (como onClick)
-export function Button({ children, variant = 'primary', loading, className = '', ...props }) {
+/**
+ * Button Component - Schedy Premium UI
+ * Foco: Alto contraste, tipografia editorial e feedback tátil.
+ */
+export function Button({ 
+  children, 
+  variant = 'primary', 
+  loading, 
+  className = '', 
+  ...props 
+}) {
   
-  const baseStyles = "w-full py-3 px-4 rounded font-bold transition-all duration-200 flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed";
+  // Base: Cantos arredondados premium, tipografia itálica pesada e tracking apertado
+  const baseStyles = "w-full py-4 px-6 rounded-2xl font-black uppercase italic tracking-tighter transition-all duration-300 flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed active:scale-95 text-sm";
   
   const variants = {
-    primary: "bg-barber-red hover:bg-red-700 text-white shadow-lg shadow-red-900/20",
-    outline: "border border-barber-gold text-barber-gold hover:bg-barber-gold hover:text-barber-black",
-    ghost: "text-barber-gray hover:text-white"
+    // Principal: Preto sólido (contraste total no fundo claro)
+    primary: "bg-schedy-black text-white shadow-vivid hover:bg-schedy-gray",
+    
+    // Outline: Borda de 2px preta, fundo transparente (Inverte no hover)
+    outline: "border-2 border-schedy-black text-schedy-black bg-transparent hover:bg-schedy-black hover:text-white",
+    
+    // Ghost: Para ações secundárias, apenas texto e hover suave
+    ghost: "text-schedy-gray hover:text-schedy-black hover:bg-schedy-canvas",
+    
+    // Danger: Para exclusão (Vermelho Vivo)
+    danger: "bg-schedy-danger text-white hover:bg-red-700 shadow-sm"
   };
 
   return (
@@ -22,7 +36,10 @@ export function Button({ children, variant = 'primary', loading, className = '',
       {...props}
     >
       {loading ? (
-        <span className="animate-pulse">Processando...</span>
+        <div className="flex items-center gap-2">
+          <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
+          <span className="animate-pulse">Sincronizando...</span>
+        </div>
       ) : children}
     </button>
   );

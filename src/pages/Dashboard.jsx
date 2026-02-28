@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { AppLayout } from '../components/ui/AppLayout';
 import { DayView } from '../components/calendar/DayView';
-import { DashboardHeader } from '../components/dashboard/DashboardHeader';
 import { AppointmentModal } from '../components/dashboard/AppointmentModal';
 import { BlockModal } from '../components/dashboard/BlockModal';
-import { format, addDays, subDays, isSameDay, isBefore } from 'date-fns';
+import { Button } from '../components/ui/Button';
+import { Plus, Lock, Sun } from 'lucide-react';
+import { format, addDays, isSameDay, isBefore, startOfWeek, endOfWeek } from 'date-fns';
 import { 
   getServices, 
   addAppointment, 
@@ -18,12 +19,11 @@ import {
 
 export function Dashboard() {
   // --- DATA STATES ---
-  const [timezone, setTimezone] = useState('America/New_York');
+  const [profile, setProfile] = useState(null);
   const [selectedDate, setSelectedDate] = useState(new Date());
   const [appointments, setAppointments] = useState([]);
   const [services, setServices] = useState([]);
-  const [currency, setCurrency] = useState('$'); 
-  const [businessHours, setBusinessHours] = useState({ open: "08:00", close: "18:00", break: "12:00-13:00" });
+  const [businessHours, setBusinessHours] = useState({ open: "07:00", close: "22:00", break: "12:00-13:00" });
 
   // --- UI STATES ---
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -32,70 +32,65 @@ export function Dashboard() {
   const [editingAppointment, setEditingAppointment] = useState(null);
   const [modalInitialDate, setModalInitialDate] = useState(new Date());
 
-  // --- HELPERS ---
-  const getNowInTimezone = (tz) => {
-    const now = new Date();
-    const localTime = now.toLocaleString("en-US", { timeZone: tz });
-    return new Date(localTime);
-  };
-
-  const checkConflict = (startISO, duration, excludeId = null) => {
-    const newBegin = new Date(startISO).getTime();
-    const newEnd = newBegin + (parseInt(duration) * 60000);
-    return appointments.some(apt => {
-      if (apt.id === excludeId) return false; 
-      const exBegin = new Date(apt.startTime).getTime();
-      const exEnd = exBegin + (parseInt(apt.duration) * 60000);
-      return (newBegin < exEnd && newEnd > exBegin);
-    });
-  };
+  const timezone = profile?.timezone || 'Europe/Lisbon';
 
   // --- DATA LOADING ---
   useEffect(() => {
-    loadStaticData();
-    const interval = setInterval(refreshAppointments, 10000); 
+    loadInitialData();
+    const interval = setInterval(refreshAppointments, 15000); 
     return () => clearInterval(interval);
-  }, [timezone]); 
+  }, []); 
 
-  const loadStaticData = async () => {
+  const loadInitialData = async () => {
     try {
-      const profile = await getProfessionalProfile();
-      if (profile) {
-        setCurrency(profile.currency || '$');
-        if (profile.timezone) {
-            setTimezone(profile.timezone);
-            setSelectedDate(getNowInTimezone(profile.timezone));
-        }
-        if (profile.settings?.businessHours) {
-          setBusinessHours(prev => ({ ...prev, ...profile.settings.businessHours }));
+      const prof = await getProfessionalProfile();
+      if (prof) {
+        setProfile(prof);
+        if (prof.settings?.businessHours) {
+          setBusinessHours(prev => ({ ...prev, ...prof.settings.businessHours }));
         }
       }
       const servicesData = await getServices();
       setServices(servicesData);
       await refreshAppointments();
-    } catch (error) { console.error("Load failed", error); }
+    } catch (error) { console.error("Sync Error:", error); }
   };
 
   const refreshAppointments = async () => {
     try {
       const data = await getAppointments();
       setAppointments(data);
-    } catch (error) { console.error("Sync failed", error); }
+    } catch (error) { console.error("Fetch Error:", error); }
   };
+
+  // --- HELPERS ---
+  const getNowInTimezone = () => {
+    return new Date(new Date().toLocaleString("en-US", { timeZone: timezone }));
+  };
+
+  // Mapeia a cor do serviço para o agendamento
+  const appointmentsWithColors = appointments.map(apt => {
+    const service = services.find(s => s.name === apt.serviceName);
+    return { ...apt, color: service?.color || 'emerald' };
+  });
+
+  // Filtra agendamentos para a semana inteira (Sun-Sat)
+  const weekStart = startOfWeek(selectedDate, { weekStartsOn: 0 });
+  const weekEnd = endOfWeek(selectedDate, { weekStartsOn: 0 });
+  const filteredAppointments = appointmentsWithColors.filter(apt => {
+    const date = new Date(apt.startTime);
+    return date >= weekStart && date <= weekEnd;
+  });
 
   // --- HANDLERS ---
   const handleSaveAppointment = async (formData) => {
     const { clientName, selectedServiceIds, time, notes, formDate } = formData;
     const selectedData = services.filter(s => selectedServiceIds.includes(s.id));
-    if (selectedData.length === 0) return alert("Select a service.");
     
     const totalDuration = selectedData.reduce((acc, s) => acc + s.duration, 0);
     const totalPrice = selectedData.reduce((acc, s) => acc + s.price, 0);
     const combinedServiceName = selectedData.map(s => s.name).join(' + ');
     const fullStartDateStr = `${format(formDate, 'yyyy-MM-dd')}T${time}:00`;
-
-    if (isBefore(new Date(fullStartDateStr), getNowInTimezone(timezone))) return alert("Past dates forbidden.");
-    if (checkConflict(fullStartDateStr, totalDuration, editingAppointment?.id)) return alert("Conflict detected.");
 
     setLoading(true);
     try {
@@ -108,62 +103,47 @@ export function Dashboard() {
       else await addAppointment(aptData);
       await refreshAppointments();
       setIsModalOpen(false);
-    } catch (error) { alert("Save error"); } 
+    } catch (error) { alert("Save Error"); } 
     finally { setLoading(false); }
-  };
-
-  const handleSaveBlock = async (formData) => {
-    const { blockTime, blockDuration, blockRecurrence, blockOccurrences, blockNotes, formDate } = formData;
-    const fullStartDateStr = `${format(formDate, 'yyyy-MM-dd')}T${blockTime}:00`;
-    
-    if (checkConflict(fullStartDateStr, blockDuration)) return alert("Conflict detected.");
-
-    setLoading(true);
-    try {
-      await addBlockedTime({
-        startTime: fullStartDateStr, duration: blockDuration, notes: blockNotes,
-        recurrence: blockRecurrence, occurrences: blockOccurrences
-      });
-      await refreshAppointments();
-      setIsBlockModalOpen(false);
-    } catch (error) { alert("Block error"); }
-    finally { setLoading(false); }
-  };
-
-  const handleQuickDelete = async (id) => {
-    if (!confirm("Are you sure?")) return;
-    try {
-      await deleteAppointment(id);
-      refreshAppointments();
-    } catch (error) { alert("Delete error"); }
-  };
-
-  const handleToggleComplete = async (id) => {
-    const apt = appointments.find(a => a.id === id);
-    if (!apt || apt.type === 'block') return;
-    try {
-      await updateAppointmentFull(id, { ...apt, status: apt.status === 'completed' ? 'scheduled' : 'completed' });
-      refreshAppointments();
-    } catch (error) { alert("Status error"); }
   };
 
   return (
     <AppLayout>
-      <DashboardHeader 
-        timezone={timezone}
-        selectedDate={selectedDate}
-        onPrevDay={() => setSelectedDate(prev => subDays(prev, 1))}
-        onNextDay={() => setSelectedDate(prev => addDays(prev, 1))}
-        onToday={() => setSelectedDate(getNowInTimezone(timezone))}
-        onOpenBlock={() => { setModalInitialDate(selectedDate); setIsBlockModalOpen(true); }}
-        onOpenBooking={() => { setEditingAppointment(null); setModalInitialDate(selectedDate); setIsModalOpen(true); }}
-      />
+      {/* HEADER MINIMALISTA DE UMA LINHA (WOW FACTOR) */}
+      <div className="flex items-center justify-between mb-6 bg-white p-4 rounded-[24px] border border-schedy-border shadow-sm">
+        <div className="flex items-center gap-6">
+          <div>
+            <h1 className="text-xl font-black uppercase italic tracking-tighter text-schedy-black leading-none">
+              {profile?.barberShopName || 'Schedule'}
+            </h1>
+            <p className="text-[10px] font-bold text-schedy-gray uppercase tracking-widest mt-1 flex items-center gap-1">
+              <Sun size={10} /> {profile?.country === 'PT' ? 'Lisbon' : 'Miami'} Time
+            </p>
+          </div>
+        </div>
 
-      <div className="h-[calc(100vh-240px)] sm:h-[calc(100vh-210px)] min-h-[400px]">
+        {/* BOTÕES DE AÇÃO RÁPIDA */}
+        <div className="flex items-center gap-2">
+          <button 
+            onClick={() => { setModalInitialDate(selectedDate); setIsBlockModalOpen(true); }}
+            className="flex items-center gap-2 px-4 h-12 bg-schedy-canvas text-schedy-black rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-schedy-black hover:text-white transition-all"
+          >
+            <Lock size={14} /> Block
+          </button>
+          <Button 
+            onClick={() => { setEditingAppointment(null); setModalInitialDate(getNowInTimezone()); setIsModalOpen(true); }}
+            className="w-auto px-6 h-12 shadow-vivid"
+          >
+            <Plus size={18} className="mr-2" /> New Booking
+          </Button>
+        </div>
+      </div>
+
+      {/* ÁREA DO CALENDÁRIO (OCUPA O RESTO DA TELA) */}
+      <div className="flex-1 min-h-0">
         <DayView 
-          appointments={appointments.filter(apt => isSameDay(new Date(apt.startTime), selectedDate) || isSameDay(new Date(apt.startTime), addDays(selectedDate, 1)))} 
+          appointments={filteredAppointments} 
           onAppointmentMove={async (id, newStart) => {
-             // Lógica de move simplificada aqui ou mantida no DayView
              await updateAppointmentTime(id, newStart);
              refreshAppointments();
           }}
@@ -177,20 +157,20 @@ export function Dashboard() {
             setModalInitialDate(date);
             setIsModalOpen(true);
           }} 
-          onComplete={handleToggleComplete}
-          onDelete={handleQuickDelete}
+          onNavigate={setSelectedDate}
           startDate={selectedDate} 
           businessHours={businessHours}
           timezone={timezone} 
         />
       </div>
 
+      {/* MODAL DE AGENDAMENTO (WIDE & NO SCROLL) */}
       <AppointmentModal 
         isOpen={isModalOpen}
         onClose={() => setIsModalOpen(false)}
         editingAppointment={editingAppointment}
         services={services}
-        currency={currency}
+        currency={profile?.currency || '$'}
         onSave={handleSaveAppointment}
         onDelete={handleQuickDelete}
         initialDate={modalInitialDate}

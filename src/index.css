@@ -2,23 +2,75 @@
 @tailwind components;
 @tailwind utilities;
 
+/* 1. RESET DE FUNDO E CONTRASTE (LIGHT MODE) */
 body {
-  background-color: #0F0F0F;
-  color: #F5F5F5;
-  font-family: sans-serif;
+  background-color: #F4F7F9; /* Schedy Canvas */
+  color: #0A0A0B; /* Schedy Black */
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  overflow: hidden; /* O scroll será controlado internamente pelos componentes */
+  -webkit-font-smoothing: antialiased;
 }
-/* Adicione no final do seu src/index.css */
-@keyframes pulse-gold {
+
+/* 2. SCROLLBARS MINIMALISTAS (PREMIUM UI) */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #E2E8F0; /* Schedy Border */
+  border-radius: 10px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #64748B; /* Schedy Gray */
+}
+
+/* 3. CAMADAS DE PROFUNDIDADE (Z-INDEX) */
+.z-sidebar { z-index: 50; }
+.z-modal { z-index: 100; }
+.z-tooltip { z-index: 60; }
+
+/* 4. ANIMAÇÃO DE PULSO PARA CARDS COM NOTAS (REESTILIZADO) */
+@keyframes pulse-service {
   0%, 100% {
-    box-shadow: 0 0 5px rgba(197, 160, 89, 0.2);
-    border-color: rgba(197, 160, 89, 0.5);
+    box-shadow: 0 0 5px rgba(0, 0, 0, 0.05);
+    transform: scale(1);
   }
   50% {
-    box-shadow: 0 0 20px rgba(197, 160, 89, 0.6);
-    border-color: rgba(197, 160, 89, 1);
+    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+    transform: scale(1.01);
   }
 }
 
-.animate-pulse-gold {
-  animation: pulse-gold 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+.animate-pulse-service {
+  animation: pulse-service 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* 5. FIX PARA ELEMENTOS QUE FICAM ATRÁS DA SIDEBAR */
+main {
+  position: relative;
+  z-index: 10;
+}
+
+/* 6. CORREÇÃO DE BOTÕES "BRANCO NO BRANCO" */
+button[variant="outline"] {
+  border: 2px solid #0A0A0B;
+  background-color: transparent;
+  color: #0A0A0B;
+}
+
+button[variant="outline"]:hover {
+  background-color: #0A0A0B;
+  color: #FFFFFF;
+}
+
+/* 7. ESTILIZAÇÃO DO MODAL PARA LARGURA TOTAL */
+.modal-wide {
+  max-width: 900px !important;
+  width: 95% !important;
 }

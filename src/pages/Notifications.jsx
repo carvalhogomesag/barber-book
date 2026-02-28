@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { AppLayout } from '../components/ui/AppLayout';
+import { Button } from '../components/ui/Button';
 import { 
   Bell, 
   Check, 
@@ -10,9 +11,11 @@ import {
   MessageSquare,
   Clock,
   Loader2,
-  ChevronRight
+  ChevronRight,
+  ShieldAlert
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
+import { ptBR } from 'date-fns/locale'; // Para datas amigáveis em PT
 import { Link } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { db } from '../services/firebase';
@@ -23,11 +26,9 @@ export function Notifications() {
   const [alerts, setAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
 
-  // 1. ESCUTA EM TEMPO REAL (Observabilidade Enterprise)
   useEffect(() => {
     if (!profile?.id) return;
 
-    // Conecta na subcoleção de alertas que o nosso backend popula
     const alertsRef = collection(db, 'barbers', profile.id, 'alerts');
     const q = query(alertsRef, orderBy('createdAt', 'desc'));
 
@@ -50,9 +51,7 @@ export function Notifications() {
     try {
       const alertRef = doc(db, 'barbers', profile.id, 'alerts', alertId);
       await updateDoc(alertRef, { resolved: true });
-    } catch (error) {
-      console.error(error);
-    }
+    } catch (error) { console.error(error); }
   };
 
   const handleDelete = async (alertId) => {
@@ -60,37 +59,38 @@ export function Notifications() {
     try {
       const alertRef = doc(db, 'barbers', profile.id, 'alerts', alertId);
       await deleteDoc(alertRef);
-    } catch (error) {
-      console.error(error);
-    }
+    } catch (error) { console.error(error); }
   };
 
-  // 2. MAPEAMENTO DE CATEGORIAS (Circuit Breaker / Governor / HITL)
   const getAlertConfig = (type) => {
     switch (type) {
       case 'HUMAN_INTERVENTION_REQUIRED':
         return {
-          icon: <UserPlus className="text-barber-gold" size={20} />,
-          label: "Transbordo Humano",
-          color: "border-barber-gold/30 bg-barber-gold/5"
+          icon: <UserPlus size={20} />,
+          label: "Atenção Manual",
+          colorClass: "bg-service-amber",
+          borderClass: "border-service-amber/20"
         };
       case 'CIRCUIT_BREAKER_FAILURE':
         return {
-          icon: <ZapOff className="text-red-500" size={20} />,
-          label: "Falha de Sistema",
-          color: "border-red-500/30 bg-red-500/5"
+          icon: <ZapOff size={20} />,
+          label: "Falha Crítica",
+          colorClass: "bg-schedy-danger",
+          borderClass: "border-schedy-danger/20"
         };
       case 'IA_STUCK':
         return {
-          icon: <AlertOctagon className="text-orange-500" size={20} />,
+          icon: <AlertOctagon size={20} />,
           label: "IA Estagnada",
-          color: "border-orange-500/30 bg-orange-500/5"
+          colorClass: "bg-service-orange",
+          borderClass: "border-service-orange/20"
         };
       default:
         return {
-          icon: <Bell className="text-zinc-500" size={20} />,
+          icon: <Bell size={20} />,
           label: "Notificação",
-          color: "border-zinc-800 bg-zinc-900/50"
+          colorClass: "bg-schedy-gray",
+          borderClass: "border-schedy-border"
         };
     }
   };
@@ -99,106 +99,116 @@ export function Notifications() {
 
   return (
     <AppLayout>
-      <header className="mb-8 flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-black text-barber-white uppercase italic tracking-tighter flex items-center gap-3">
-            <Bell className="text-barber-gold" size={24} />
-            Command Center
-          </h1>
-          <p className="text-barber-gray font-bold uppercase tracking-widest text-[10px] opacity-70 italic">
-            Monitoring AI reliability and customer escalations
-          </p>
+      {/* HEADER MINIMALISTA (UMA LINHA) */}
+      <header className="flex items-center justify-between mb-8 bg-white p-6 rounded-[24px] border border-schedy-border shadow-sm">
+        <div className="flex items-center gap-4">
+          <div className="bg-schedy-black p-2.5 rounded-xl text-white relative">
+            <Bell size={20} />
+            {unresolvedCount > 0 && (
+              <span className="absolute -top-1 -right-1 w-3 h-3 bg-schedy-danger rounded-full border-2 border-white animate-pulse" />
+            )}
+          </div>
+          <div>
+            <h1 className="text-xl font-black text-schedy-black tracking-tighter uppercase italic leading-none">Inbox & Alertas</h1>
+            <p className="text-[10px] font-bold text-schedy-gray uppercase tracking-widest mt-1">Centro de Comando IA</p>
+          </div>
         </div>
-        
+
         {unresolvedCount > 0 && (
-            <div className="bg-red-500/10 border border-red-500/20 px-4 py-2 rounded-xl animate-pulse">
-                <p className="text-[10px] font-black uppercase tracking-widest text-red-500">
-                    {unresolvedCount} Actions Required
-                </p>
+            <div className="hidden md:flex items-center gap-2 bg-red-50 px-4 py-2 rounded-xl border border-red-100">
+                <ShieldAlert size={14} className="text-schedy-danger" />
+                <span className="text-[10px] font-black uppercase tracking-widest text-schedy-danger">
+                    {unresolvedCount} Ações Pendentes
+                </span>
             </div>
         )}
       </header>
 
       {loading ? (
-        <div className="flex flex-col items-center justify-center py-20 gap-4">
-            <Loader2 className="animate-spin text-barber-gold" size={32} />
-            <p className="text-zinc-600 text-[10px] font-black uppercase tracking-[0.3em]">Syncing Alerts...</p>
+        <div className="flex flex-col items-center justify-center py-24 gap-4">
+            <Loader2 className="animate-spin text-schedy-black" size={32} />
+            <p className="text-schedy-gray text-[10px] font-black uppercase tracking-[0.3em]">Sincronizando Alertas...</p>
         </div>
       ) : alerts.length === 0 ? (
-        <div className="text-center py-24 bg-zinc-900/10 border-2 border-dashed border-zinc-800 rounded-[3rem]">
-          <Bell className="text-zinc-800 mx-auto mb-4" size={48} />
-          <p className="text-zinc-600 font-black uppercase tracking-widest text-xs italic">
-            Systems Operational. No alerts.
-          </p>
+        <div className="text-center py-32 bg-white border-2 border-dashed border-schedy-border rounded-[40px]">
+          <div className="w-16 h-16 bg-schedy-canvas rounded-full flex items-center justify-center mx-auto mb-6">
+            <Check className="text-schedy-gray" size={32} />
+          </div>
+          <p className="text-schedy-black font-black uppercase tracking-tighter text-xl italic">Tudo sob controle</p>
+          <p className="text-schedy-gray font-bold uppercase tracking-widest text-[10px] mt-2">Nenhum alerta detectado no momento.</p>
         </div>
       ) : (
-        <div className="space-y-4 max-w-4xl mx-auto">
+        <div className="space-y-4 max-w-5xl mx-auto pb-12">
           {alerts.map((alert) => {
             const config = getAlertConfig(alert.type);
             return (
               <div 
                 key={alert.id} 
                 className={`
-                  relative p-6 rounded-3xl border transition-all duration-300
-                  ${alert.resolved ? 'bg-barber-black border-zinc-800 opacity-50 grayscale' : config.color}
+                  group bg-white border-2 rounded-[32px] p-6 transition-all duration-300 relative overflow-hidden shadow-sm hover:shadow-premium
+                  ${alert.resolved ? 'opacity-50 grayscale' : config.borderClass}
                 `}
               >
-                <div className="flex flex-col sm:flex-row items-start gap-5">
-                  {/* Badge de Tipo */}
-                  <div className="w-12 h-12 rounded-2xl bg-zinc-950 border border-zinc-800 flex items-center justify-center shrink-0 shadow-inner">
+                {/* Ear de Status Lateral */}
+                <div className={`absolute left-0 top-0 bottom-0 w-3 ${alert.resolved ? 'bg-schedy-border' : config.colorClass}`} />
+
+                <div className="flex flex-col lg:flex-row lg:items-center gap-6 pl-4">
+                  
+                  {/* Ícone de Categoria */}
+                  <div className={`w-14 h-14 rounded-2xl flex items-center justify-center shrink-0 shadow-sm ${alert.resolved ? 'bg-schedy-canvas text-schedy-gray' : `${config.colorClass} text-white`}`}>
                     {config.icon}
                   </div>
 
                   <div className="flex-1 min-w-0">
-                    <div className="flex justify-between items-start mb-1">
-                      <div>
-                        <span className="text-[9px] font-black uppercase tracking-widest text-barber-gold mb-1 block">
+                    <div className="flex flex-wrap items-center justify-between gap-4 mb-2">
+                      <div className="flex items-center gap-3">
+                        <span className={`text-[9px] font-black uppercase tracking-widest ${alert.resolved ? 'text-schedy-gray' : 'text-schedy-black'}`}>
                           {config.label}
                         </span>
-                        <h3 className={`text-base font-black uppercase italic tracking-wide ${alert.resolved ? 'text-zinc-500' : 'text-white'}`}>
-                          {alert.reason?.replace(/_/g, ' ') || "Action Required"}
-                        </h3>
-                      </div>
-                      <div className="flex items-center gap-1 text-[10px] text-zinc-500 font-bold whitespace-nowrap bg-zinc-950 px-3 py-1 rounded-full border border-zinc-800">
-                          <Clock size={10} />
-                          {alert.createdAt ? formatDistanceToNow(new Date(alert.createdAt), { addSuffix: true }) : 'Now'}
+                        <div className="h-1 w-1 bg-schedy-border rounded-full" />
+                        <div className="flex items-center gap-1.5 text-[10px] text-schedy-gray font-bold italic">
+                            <Clock size={12} />
+                            {alert.createdAt ? formatDistanceToNow(new Date(alert.createdAt), { addSuffix: true, locale: ptBR }) : 'Agora'}
+                        </div>
                       </div>
                     </div>
                     
-                    <p className="text-xs text-zinc-400 leading-relaxed font-medium mb-6 italic">
-                      {alert.description || `O cliente ${alert.clientPhone} precisa de atenção manual.`}
+                    <h3 className={`text-lg font-black uppercase italic tracking-tight mb-2 ${alert.resolved ? 'text-schedy-gray' : 'text-schedy-black'}`}>
+                      {alert.reason?.replace(/_/g, ' ') || "Intervenção Necessária"}
+                    </h3>
+                    
+                    <p className="text-sm text-schedy-gray font-medium leading-relaxed max-w-2xl">
+                      {alert.description || `O cliente ${alert.clientPhone} precisa de suporte humano.`}
                     </p>
+                  </div>
 
-                    <div className="flex flex-wrap gap-3">
-                      <Link 
-                        to="/messages" 
-                        className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-barber-white text-black text-[10px] font-black uppercase hover:bg-barber-gold transition-colors shadow-lg shadow-white/5"
-                      >
-                        <MessageSquare size={14} /> Take Over Chat <ChevronRight size={14} />
-                      </Link>
-                      
-                      {!alert.resolved && (
-                        <button 
-                          onClick={() => handleMarkAsResolved(alert.id)}
-                          className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-[10px] font-black uppercase transition-colors"
-                        >
-                          <Check size={14} /> Resolve
-                        </button>
-                      )}
-
+                  {/* Ações */}
+                  <div className="flex items-center gap-2 shrink-0">
+                    <Link to="/messages">
+                      <Button variant="primary" className="h-12 px-6 text-[10px] w-auto shadow-vivid">
+                        Assumir Chat <ChevronRight size={14} className="ml-1" />
+                      </Button>
+                    </Link>
+                    
+                    {!alert.resolved && (
                       <button 
-                        onClick={() => handleDelete(alert.id)}
-                        className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-zinc-900 hover:bg-red-500/10 hover:text-red-500 text-zinc-500 text-[10px] font-black uppercase transition-colors"
+                        onClick={() => handleMarkAsResolved(alert.id)}
+                        className="p-3 bg-schedy-canvas text-schedy-black border border-schedy-border rounded-xl hover:bg-schedy-black hover:text-white transition-all"
+                        title="Marcar como resolvido"
                       >
-                        <Trash2 size={14} />
+                        <Check size={20} />
                       </button>
-                    </div>
+                    )}
+
+                    <button 
+                      onClick={() => handleDelete(alert.id)}
+                      className="p-3 bg-red-50 text-schedy-danger border border-red-100 rounded-xl hover:bg-schedy-danger hover:text-white transition-all"
+                      title="Excluir"
+                    >
+                      <Trash2 size={20} />
+                    </button>
                   </div>
                 </div>
-                
-                {!alert.resolved && (
-                  <div className="absolute top-4 right-4 w-2 h-2 bg-red-500 rounded-full animate-ping" />
-                )}
               </div>
             );
           })}
