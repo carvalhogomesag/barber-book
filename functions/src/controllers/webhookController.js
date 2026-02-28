@@ -33,7 +33,7 @@ async function executeAutoBooking(db, barberId, fromNumber, bookingData, clientN
 
     if (!existingQuery.empty) {
       console.log(`[IDEMPOTENCY] Agendamento ignorado: Já existe registro para ${fromNumber} em ${startTime}`);
-      return true; // Retorna true para limpar a tag, pois o objetivo já está cumprido
+      return true; 
     }
 
     // 2. BUSCA DADOS REAIS DO SERVIÇO (Fonte de Verdade)
@@ -52,7 +52,7 @@ async function executeAutoBooking(db, barberId, fromNumber, bookingData, clientN
       startTime: startTime,
       price: serviceInfo.price,
       duration: serviceInfo.duration,
-      status: 'CONFIRMED', // Estado inicial transacional
+      status: 'CONFIRMED',
       source: 'ai_concierge_deterministic',
       createdAt: new Date().toISOString()
     });
@@ -126,7 +126,6 @@ exports.handleIncomingMessage = async (req, res) => {
   const messageBody = req.body.Body || "";
   const isCall = req.body.CallSid || (!req.body.Body && req.body.From);
 
-  // Contexto para logs e Circuit Breaker
   let currentContext = { barberId: null, clientPhone: fromNumber, flow: isCall ? "VOICE" : "TEXT" };
 
   try {
@@ -145,8 +144,8 @@ exports.handleIncomingMessage = async (req, res) => {
     }
 
     // --- 1. INVARIANTE: READ-BEFORE-RESPOND (Princípio 2.2) ---
-    // Consulta Firestore obrigatória para validar o estado real do banco antes de responder
-    const validatedState = await bookingService.checkBookingStatus(result.barberId, fromNumber);
+    // ATUALIZAÇÃO CRÍTICA: Passamos 'result.clientName' para habilitar a busca em cascata (Telefone -> Nome)
+    const validatedState = await bookingService.checkBookingStatus(result.barberId, fromNumber, result.clientName);
 
     // --- 2. CONVERSATION GOVERNOR (Princípio 7) ---
     const mappingDoc = await result.mappingRef.get();
@@ -184,7 +183,6 @@ exports.handleIncomingMessage = async (req, res) => {
     }
 
     // --- 4. LLM ISOLATION (Princípio 2.3) ---
-    // A IA recebe o estado validado e apenas gera a resposta em linguagem natural
     const aiConfigSnap = await db.collection("settings").doc("ai_config").get();
     let responseText = await processMessageWithAI({
       barberId: result.barberId,
@@ -199,7 +197,7 @@ exports.handleIncomingMessage = async (req, res) => {
       targetLanguage: LANGUAGE_MAP[result.barberData.country || 'US'],
       barberTimezone: result.barberData.timezone || 'UTC',
       serverTimeISO: new Date().toISOString(),
-      validatedBookingState: validatedState // O dado estruturado injetado
+      validatedBookingState: validatedState 
     });
 
     // --- 5. PERSISTÊNCIA DE ESTADO E GOVERNOR ---
@@ -213,7 +211,6 @@ exports.handleIncomingMessage = async (req, res) => {
     }, { merge: true });
 
     // --- 6. TRANSACTIONAL TAG PARSER ---
-    // Escalonamento Humano via Tag
     if (responseText.includes("[PAUSE_AI]")) {
       await result.mappingRef.set({ tenants: { [result.barberId]: { status: 'paused' } } }, { merge: true });
       const chatRef = db.collection("barbers").doc(result.barberId).collection("chats").doc(fromNumber);
@@ -221,7 +218,6 @@ exports.handleIncomingMessage = async (req, res) => {
       responseText = responseText.replace("[PAUSE_AI]", "").trim();
     }
 
-    // Gravação de Agendamento via Tag
     const tagMatch = responseText.match(/\[FINALIZAR_AGENDAMENTO:\s*({.*?})\]/s);
     if (tagMatch) {
       try {
@@ -229,7 +225,6 @@ exports.handleIncomingMessage = async (req, res) => {
         const success = await executeAutoBooking(db, result.barberId, fromNumber, bookingData, result.clientName);
         if (success) {
           responseText = responseText.replace(/\[FINALIZAR_AGENDAMENTO:.*?\]/gs, "").trim();
-          // Reset interaction count ao finalizar com sucesso
           await result.mappingRef.set({ tenants: { [result.barberId]: { interactionCount: 0 } } }, { merge: true });
         }
       } catch (e) { console.error("[TAG_PARSER_ERROR]", e); }
@@ -239,12 +234,9 @@ exports.handleIncomingMessage = async (req, res) => {
     res.status(200).type("text/xml").send(twiml.toString());
 
   } catch (error) {
-    // --- 7. CIRCUIT BREAKER (Princípio 6) ---
-    // Ativa o protocolo de falha crítica: Log, Alerta no Dashboard e Pausa da IA
     await circuitBreaker.trigger(error, currentContext);
-    
     const fallbackMsg = "Estou com dificuldade para acessar a agenda agora. Vou solicitar que o profissional te responda manualmente em instantes! 🤖";
     twiml.message(fallbackMsg);
     res.status(200).type("text/xml").send(twiml.toString());
   }
-};
+};  
