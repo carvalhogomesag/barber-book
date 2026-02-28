@@ -741,53 +741,48 @@ export const useAuth = () => useContext(AuthContext);
 
 --- ARQUIVO: src/utils/timeGrid.js ---
 ```javascript
-import { setHours, startOfDay } from 'date-fns';
+import { setHours, startOfDay, addMinutes, roundToNearestMinutes } from 'date-fns';
 
-// Configurações do Calendário
-export const START_HOUR = 0; 
-export const END_HOUR = 23;  
+/**
+ * CONFIGURAÇÕES DE VISIBILIDADE (UX FOCUS)
+ * Definimos o foco comercial: das 07:00 às 22:00.
+ */
+export const START_HOUR = 7; 
+export const END_HOUR = 22;  
 
-// Mudança de estratégia: Em vez de um número fixo, definimos quantas horas queremos ver.
-// Se quisermos ver 10 horas, calculamos a altura dinamicamente no componente.
-// Por padrão, manteremos 90 para telas grandes, mas o DayView agora vai ajustar isso.
-export const PIXELS_PER_HOUR = 90; 
+/**
+ * PIXELS_PER_HOUR
+ * Ajustado para 100px para dar uma sensação de amplitude e luxo no "Light Mode".
+ */
+export const PIXELS_PER_HOUR = 100; 
 
 /**
  * Calcula a posição (TOP) de um horário específico no grid.
- * @param {string | Date} dateString - Data no formato ISO ou objeto Date
- * @param {number} customPixelsPerHour - (Opcional) Valor customizado de pixels por hora
+ * O cálculo é relativo à START_HOUR (07:00).
  */
 export const getPositionFromTime = (dateString, customPixelsPerHour = PIXELS_PER_HOUR) => {
   const date = new Date(dateString);
-  const startOfDayDate = setHours(startOfDay(date), START_HOUR);
   
-  // Diferença em milissegundos convertida para horas decimais (ex: 10:30 = 10.5)
-  const diffInHours = (date - startOfDayDate) / (1000 * 60 * 60);
+  // Criamos a âncora de início do grid (Ex: Hoje às 07:00)
+  const anchorDate = setHours(startOfDay(date), START_HOUR);
   
-  return diffInHours * customPixelsPerHour;
+  // Diferença em horas decimais
+  const diffInHours = (date.getTime() - anchorDate.getTime()) / (1000 * 60 * 60);
+  
+  // Se o horário for antes das 07:00, retornamos 0 para não quebrar o layout
+  return Math.max(0, diffInHours * customPixelsPerHour);
 };
 
 /**
- * Calcula a posição da "Linha de Agora" (Time Indicator)
- */
-export const getNowPosition = (timezone, customPixelsPerHour = PIXELS_PER_HOUR) => {
-  const now = new Date();
-  // Obtém a hora local no fuso horário do profissional
-  const localTimeString = now.toLocaleString("en-US", { timeZone: timezone });
-  const localDate = new Date(localTimeString);
-  
-  return getPositionFromTime(localDate, customPixelsPerHour);
-};
-
-/**
- * Calcula a altura do card baseada na duração do serviço
+ * Calcula a altura do card baseada na duração do serviço.
+ * Um serviço de 60min terá exatamente customPixelsPerHour de altura.
  */
 export const getHeightFromDuration = (durationInMinutes, customPixelsPerHour = PIXELS_PER_HOUR) => {
   return (durationInMinutes / 60) * customPixelsPerHour;
 };
 
 /**
- * Gera a lista de horas (00:00 a 23:00)
+ * Gera a lista de horas (07:00 a 22:00) para o eixo lateral.
  */
 export const hoursArray = Array.from(
   { length: END_HOUR - START_HOUR + 1 },
@@ -795,37 +790,46 @@ export const hoursArray = Array.from(
 );
 
 /**
+ * LÓGICA DE DRAG & DROP (SNAP)
  * Converte o movimento de pixels de volta para um horário ISO.
- * Usado para o Drag & Drop.
  */
 export const getNewStartTime = (originalStartTime, pixelsMoved, customPixelsPerHour = PIXELS_PER_HOUR) => {
   const originalDate = new Date(originalStartTime);
   
-  // Converte pixels movidos em minutos
+  // Converte pixels em minutos totais movidos
   const minutesMoved = (pixelsMoved / customPixelsPerHour) * 60;
   
-  // Adiciona os minutos à data original
-  const newDate = new Date(originalDate.getTime() + minutesMoved * 60000);
+  // Calcula nova data bruta
+  let newDate = addMinutes(originalDate, minutesMoved);
   
-  // Imã de 15 minutos (Snap)
-  const minutes = newDate.getMinutes();
-  const roundedMinutes = Math.round(minutes / 15) * 15;
-  newDate.setMinutes(roundedMinutes);
-  newDate.setSeconds(0);
-  newDate.setMilliseconds(0);
+  // UX SNAP: Imã de 15 minutos para facilitar o encaixe perfeito na agenda
+  newDate = roundToNearestMinutes(newDate, { nearestTo: 15 });
   
-  // Retorna ISO formatado corretamente (sem problemas de fuso)
+  // Bloqueio de limite superior (Não deixar arrastar para antes das 07:00)
+  const minLimit = setHours(startOfDay(newDate), START_HOUR);
+  if (newDate < minLimit) return minLimit.toISOString();
+
   return newDate.toISOString();
 };
 
 /**
- * Formata a exibição de hora para o usuário
+ * Formata a exibição de hora no padrão 24h elegante (High Contrast)
  */
 export const formatTimeDisplay = (isoString) => {
   if (!isoString) return "--:--";
   const date = new Date(isoString);
-  return date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  return date.toLocaleTimeString('pt-BR', { 
+    hour: '2-digit', 
+    minute: '2-digit',
+    hour12: false 
+  });
 };
+
+/**
+ * TOTAL_GRID_HEIGHT
+ * Útil para definir a altura total do container de scroll do calendário.
+ */
+export const TOTAL_GRID_HEIGHT = (END_HOUR - START_HOUR + 1) * PIXELS_PER_HOUR;
 ```
 
 
@@ -946,25 +950,77 @@ ReactDOM.createRoot(document.getElementById('root')).render(
 @tailwind components;
 @tailwind utilities;
 
+/* 1. RESET DE FUNDO E CONTRASTE (LIGHT MODE) */
 body {
-  background-color: #0F0F0F;
-  color: #F5F5F5;
-  font-family: sans-serif;
+  background-color: #F4F7F9; /* Schedy Canvas */
+  color: #0A0A0B; /* Schedy Black */
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  overflow: hidden; /* O scroll será controlado internamente pelos componentes */
+  -webkit-font-smoothing: antialiased;
 }
-/* Adicione no final do seu src/index.css */
-@keyframes pulse-gold {
+
+/* 2. SCROLLBARS MINIMALISTAS (PREMIUM UI) */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #E2E8F0; /* Schedy Border */
+  border-radius: 10px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #64748B; /* Schedy Gray */
+}
+
+/* 3. CAMADAS DE PROFUNDIDADE (Z-INDEX) */
+.z-sidebar { z-index: 50; }
+.z-modal { z-index: 100; }
+.z-tooltip { z-index: 60; }
+
+/* 4. ANIMAÇÃO DE PULSO PARA CARDS COM NOTAS (REESTILIZADO) */
+@keyframes pulse-service {
   0%, 100% {
-    box-shadow: 0 0 5px rgba(197, 160, 89, 0.2);
-    border-color: rgba(197, 160, 89, 0.5);
+    box-shadow: 0 0 5px rgba(0, 0, 0, 0.05);
+    transform: scale(1);
   }
   50% {
-    box-shadow: 0 0 20px rgba(197, 160, 89, 0.6);
-    border-color: rgba(197, 160, 89, 1);
+    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+    transform: scale(1.01);
   }
 }
 
-.animate-pulse-gold {
-  animation: pulse-gold 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+.animate-pulse-service {
+  animation: pulse-service 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* 5. FIX PARA ELEMENTOS QUE FICAM ATRÁS DA SIDEBAR */
+main {
+  position: relative;
+  z-index: 10;
+}
+
+/* 6. CORREÇÃO DE BOTÕES "BRANCO NO BRANCO" */
+button[variant="outline"] {
+  border: 2px solid #0A0A0B;
+  background-color: transparent;
+  color: #0A0A0B;
+}
+
+button[variant="outline"]:hover {
+  background-color: #0A0A0B;
+  color: #FFFFFF;
+}
+
+/* 7. ESTILIZAÇÃO DO MODAL PARA LARGURA TOTAL */
+.modal-wide {
+  max-width: 900px !important;
+  width: 95% !important;
 }
 ```
 
@@ -980,15 +1036,38 @@ export default {
   theme: {
     extend: {
       colors: {
-        barber: {
-          black: '#1A1A1A',
-          dark: '#0F0F0F',
-          red: '#D92525',
-          blue: '#1E40AF',
-          white: '#F5F5F5',
-          gray: '#808080',
-          gold: '#C5A059',
+        schedy: {
+          // Fundo principal ultra-limpo para contraste máximo
+          canvas: '#F4F7F9', 
+          white: '#FFFFFF',
+          // Tipografia pesada e legível (High-Contrast)
+          black: '#0A0A0B',
+          gray: '#64748B',
+          // Cor de destaque (Primary Action)
+          accent: '#000000', 
+          danger: '#EF4444',
+          border: '#E2E8F0',
+        },
+        // Paleta Vivid para Categorias de Serviço (WOW Factor)
+        service: {
+          emerald: '#10B981', // Ex: Corte Tradicional
+          amber: '#F59E0B',   // Ex: Barba
+          indigo: '#6366F1',  // Ex: Combo/Química
+          rose: '#F43F5E',    // Ex: Tratamento/Pele
+          violet: '#8B5CF6',  // Ex: Coloração
+          sky: '#0EA5E9',     // Ex: Infantil
+          orange: '#F97316',  // Ex: Especial/Noivo
         }
+      },
+      // Configuração para a Sidebar Retrátil
+      spacing: {
+        'sidebar-wide': '240px',
+        'sidebar-slim': '72px',
+      },
+      // Sombras premium para profundidade nos cards
+      boxShadow: {
+        'premium': '0 4px 20px -2px rgba(0, 0, 0, 0.05), 0 2px 10px -2px rgba(0, 0, 0, 0.03)',
+        'vivid': '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)',
       }
     },
   },
@@ -1431,10 +1510,11 @@ export function Register() {
 import React, { useState, useEffect } from 'react';
 import { AppLayout } from '../components/ui/AppLayout';
 import { DayView } from '../components/calendar/DayView';
-import { DashboardHeader } from '../components/dashboard/DashboardHeader';
 import { AppointmentModal } from '../components/dashboard/AppointmentModal';
 import { BlockModal } from '../components/dashboard/BlockModal';
-import { format, addDays, subDays, isSameDay, isBefore } from 'date-fns';
+import { Button } from '../components/ui/Button';
+import { Plus, Lock, Sun } from 'lucide-react';
+import { format, isSameDay, startOfWeek, endOfWeek } from 'date-fns';
 import { 
   getServices, 
   addAppointment, 
@@ -1447,85 +1527,91 @@ import {
 } from '../services/professionalService'; 
 
 export function Dashboard() {
-  // --- DATA STATES ---
-  const [timezone, setTimezone] = useState('America/New_York');
+  // --- ESTADOS DE DADOS ---
+  const [profile, setProfile] = useState(null);
   const [selectedDate, setSelectedDate] = useState(new Date());
   const [appointments, setAppointments] = useState([]);
   const [services, setServices] = useState([]);
-  const [currency, setCurrency] = useState('$'); 
-  const [businessHours, setBusinessHours] = useState({ open: "08:00", close: "18:00", break: "12:00-13:00" });
+  const [businessHours, setBusinessHours] = useState({ open: "07:00", close: "22:00", break: "12:00-13:00" });
 
-  // --- UI STATES ---
+  // --- ESTADOS DE UI ---
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isBlockModalOpen, setIsBlockModalOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [editingAppointment, setEditingAppointment] = useState(null);
   const [modalInitialDate, setModalInitialDate] = useState(new Date());
 
-  // --- HELPERS ---
-  const getNowInTimezone = (tz) => {
-    const now = new Date();
-    const localTime = now.toLocaleString("en-US", { timeZone: tz });
-    return new Date(localTime);
-  };
+  const timezone = profile?.timezone || 'Europe/Lisbon';
 
-  const checkConflict = (startISO, duration, excludeId = null) => {
-    const newBegin = new Date(startISO).getTime();
-    const newEnd = newBegin + (parseInt(duration) * 60000);
-    return appointments.some(apt => {
-      if (apt.id === excludeId) return false; 
-      const exBegin = new Date(apt.startTime).getTime();
-      const exEnd = exBegin + (parseInt(apt.duration) * 60000);
-      return (newBegin < exEnd && newEnd > exBegin);
-    });
-  };
-
-  // --- DATA LOADING ---
+  // --- CARREGAMENTO INICIAL ---
   useEffect(() => {
-    loadStaticData();
-    const interval = setInterval(refreshAppointments, 10000); 
+    loadInitialData();
+    const interval = setInterval(refreshAppointments, 15000); 
     return () => clearInterval(interval);
-  }, [timezone]); 
+  }, []); 
 
-  const loadStaticData = async () => {
+  const loadInitialData = async () => {
     try {
-      const profile = await getProfessionalProfile();
-      if (profile) {
-        setCurrency(profile.currency || '$');
-        if (profile.timezone) {
-            setTimezone(profile.timezone);
-            setSelectedDate(getNowInTimezone(profile.timezone));
-        }
-        if (profile.settings?.businessHours) {
-          setBusinessHours(prev => ({ ...prev, ...profile.settings.businessHours }));
+      const prof = await getProfessionalProfile();
+      if (prof) {
+        setProfile(prof);
+        if (prof.settings?.businessHours) {
+          setBusinessHours(prev => ({ ...prev, ...prof.settings.businessHours }));
         }
       }
       const servicesData = await getServices();
       setServices(servicesData);
       await refreshAppointments();
-    } catch (error) { console.error("Load failed", error); }
+    } catch (error) { console.error("Sync Error:", error); }
   };
 
   const refreshAppointments = async () => {
     try {
       const data = await getAppointments();
-      setAppointments(data);
-    } catch (error) { console.error("Sync failed", error); }
+      setAppointments(data || []);
+    } catch (error) { console.error("Fetch Error:", error); }
   };
 
-  // --- HANDLERS ---
+  // --- HELPERS ---
+  const getNowInTimezone = () => {
+    return new Date(new Date().toLocaleString("en-US", { timeZone: timezone }));
+  };
+
+  const appointmentsWithColors = appointments.map(apt => {
+    const service = services.find(s => s.name === apt.serviceName);
+    return { ...apt, color: service?.color || 'emerald' };
+  });
+
+  const weekStart = startOfWeek(selectedDate, { weekStartsOn: 0 });
+  const weekEnd = endOfWeek(selectedDate, { weekStartsOn: 0 });
+  const filteredAppointments = appointmentsWithColors.filter(apt => {
+    const date = new Date(apt.startTime);
+    return date >= weekStart && date <= weekEnd;
+  });
+
+  // --- HANDLERS (LÓGICA RESTAURADA) ---
+
+  // 1. Deletar Agendamento ou Bloqueio
+  const handleQuickDelete = async (id) => {
+    if (!confirm("Deseja realmente remover este item da agenda?")) return;
+    try {
+      await deleteAppointment(id);
+      await refreshAppointments();
+      setIsModalOpen(false);
+    } catch (error) { alert("Erro ao deletar."); }
+  };
+
+  // 2. Salvar Agendamento Manual
   const handleSaveAppointment = async (formData) => {
     const { clientName, selectedServiceIds, time, notes, formDate } = formData;
     const selectedData = services.filter(s => selectedServiceIds.includes(s.id));
-    if (selectedData.length === 0) return alert("Select a service.");
     
+    if (selectedData.length === 0) return alert("Selecione ao menos um serviço.");
+
     const totalDuration = selectedData.reduce((acc, s) => acc + s.duration, 0);
     const totalPrice = selectedData.reduce((acc, s) => acc + s.price, 0);
     const combinedServiceName = selectedData.map(s => s.name).join(' + ');
     const fullStartDateStr = `${format(formDate, 'yyyy-MM-dd')}T${time}:00`;
-
-    if (isBefore(new Date(fullStartDateStr), getNowInTimezone(timezone))) return alert("Past dates forbidden.");
-    if (checkConflict(fullStartDateStr, totalDuration, editingAppointment?.id)) return alert("Conflict detected.");
 
     setLoading(true);
     try {
@@ -1534,66 +1620,72 @@ export function Dashboard() {
         duration: totalDuration, startTime: fullStartDateStr, notes,
         status: editingAppointment ? editingAppointment.status : 'scheduled'
       };
+      
       if (editingAppointment) await updateAppointmentFull(editingAppointment.id, aptData);
       else await addAppointment(aptData);
+      
       await refreshAppointments();
       setIsModalOpen(false);
-    } catch (error) { alert("Save error"); } 
+    } catch (error) { alert("Erro ao salvar."); } 
     finally { setLoading(false); }
   };
 
+  // 3. Salvar Bloqueio de Agenda
   const handleSaveBlock = async (formData) => {
     const { blockTime, blockDuration, blockRecurrence, blockOccurrences, blockNotes, formDate } = formData;
     const fullStartDateStr = `${format(formDate, 'yyyy-MM-dd')}T${blockTime}:00`;
     
-    if (checkConflict(fullStartDateStr, blockDuration)) return alert("Conflict detected.");
-
     setLoading(true);
     try {
       await addBlockedTime({
-        startTime: fullStartDateStr, duration: blockDuration, notes: blockNotes,
-        recurrence: blockRecurrence, occurrences: blockOccurrences
+        startTime: fullStartDateStr, 
+        duration: parseInt(blockDuration), 
+        notes: blockNotes,
+        recurrence: blockRecurrence, 
+        occurrences: parseInt(blockOccurrences)
       });
       await refreshAppointments();
       setIsBlockModalOpen(false);
-    } catch (error) { alert("Block error"); }
+    } catch (error) { alert("Erro ao bloquear horário."); }
     finally { setLoading(false); }
-  };
-
-  const handleQuickDelete = async (id) => {
-    if (!confirm("Are you sure?")) return;
-    try {
-      await deleteAppointment(id);
-      refreshAppointments();
-    } catch (error) { alert("Delete error"); }
-  };
-
-  const handleToggleComplete = async (id) => {
-    const apt = appointments.find(a => a.id === id);
-    if (!apt || apt.type === 'block') return;
-    try {
-      await updateAppointmentFull(id, { ...apt, status: apt.status === 'completed' ? 'scheduled' : 'completed' });
-      refreshAppointments();
-    } catch (error) { alert("Status error"); }
   };
 
   return (
     <AppLayout>
-      <DashboardHeader 
-        timezone={timezone}
-        selectedDate={selectedDate}
-        onPrevDay={() => setSelectedDate(prev => subDays(prev, 1))}
-        onNextDay={() => setSelectedDate(prev => addDays(prev, 1))}
-        onToday={() => setSelectedDate(getNowInTimezone(timezone))}
-        onOpenBlock={() => { setModalInitialDate(selectedDate); setIsBlockModalOpen(true); }}
-        onOpenBooking={() => { setEditingAppointment(null); setModalInitialDate(selectedDate); setIsModalOpen(true); }}
-      />
+      {/* HEADER PREMIUM */}
+      <div className="flex items-center justify-between mb-6 bg-white p-4 rounded-[24px] border border-schedy-border shadow-sm">
+        <div className="flex items-center gap-6">
+          <div>
+            <h1 className="text-xl font-black uppercase italic tracking-tighter text-schedy-black leading-none">
+              {profile?.barberShopName || 'Schedule'}
+            </h1>
+            <p className="text-[10px] font-bold text-schedy-gray uppercase tracking-widest mt-1 flex items-center gap-1">
+              <Sun size={10} /> {profile?.country === 'PT' ? 'Lisbon' : 'Miami'} Time
+            </p>
+          </div>
+        </div>
 
-      <div className="h-[calc(100vh-240px)] sm:h-[calc(100vh-210px)] min-h-[400px]">
+        <div className="flex items-center gap-2">
+          <button 
+            onClick={() => { setModalInitialDate(selectedDate); setIsBlockModalOpen(true); }}
+            className="flex items-center gap-2 px-4 h-12 bg-schedy-canvas text-schedy-black rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-schedy-black hover:text-white transition-all"
+          >
+            <Lock size={14} /> Block
+          </button>
+          <Button 
+            onClick={() => { setEditingAppointment(null); setModalInitialDate(getNowInTimezone()); setIsModalOpen(true); }}
+            className="w-auto px-6 h-12 shadow-vivid"
+          >
+            <Plus size={18} className="mr-2" /> New Booking
+          </Button>
+        </div>
+      </div>
+
+      {/* CALENDÁRIO 7 DIAS */}
+      <div className="flex-1 min-h-0">
         <DayView 
-          appointments={appointments.filter(apt => isSameDay(new Date(apt.startTime), selectedDate) || isSameDay(new Date(apt.startTime), addDays(selectedDate, 1)))} 
+          appointments={filteredAppointments} 
           onAppointmentMove={async (id, newStart) => {
-             // Lógica de move simplificada aqui ou mantida no DayView
              await updateAppointmentTime(id, newStart);
              refreshAppointments();
           }}
@@ -1607,26 +1699,27 @@ export function Dashboard() {
             setModalInitialDate(date);
             setIsModalOpen(true);
           }} 
-          onComplete={handleToggleComplete}
-          onDelete={handleQuickDelete}
+          onNavigate={setSelectedDate}
           startDate={selectedDate} 
           businessHours={businessHours}
           timezone={timezone} 
         />
       </div>
 
+      {/* MODAL DE AGENDAMENTO */}
       <AppointmentModal 
         isOpen={isModalOpen}
         onClose={() => setIsModalOpen(false)}
         editingAppointment={editingAppointment}
         services={services}
-        currency={currency}
+        currency={profile?.currency || '$'}
         onSave={handleSaveAppointment}
         onDelete={handleQuickDelete}
         initialDate={modalInitialDate}
         loading={loading}
       />
 
+      {/* MODAL DE BLOQUEIO */}
       <BlockModal 
         isOpen={isBlockModalOpen}
         onClose={() => setIsBlockModalOpen(false)}
@@ -1647,7 +1740,7 @@ import { AppLayout } from '../components/ui/AppLayout';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { Modal } from '../components/ui/Modal';
-import { Plus, Trash2, Clock, DollarSign, Pencil } from 'lucide-react'; 
+import { Plus, Trash2, Clock, DollarSign, Pencil, Check } from 'lucide-react'; 
 import { 
     addService, 
     getServices, 
@@ -1656,17 +1749,29 @@ import {
     getProfessionalProfile 
 } from '../services/professionalService'; 
 
+// Paleta definida no tailwind.config.js
+const SERVICE_COLORS = [
+  { id: 'emerald', bg: 'bg-service-emerald', label: 'Verde' },
+  { id: 'amber',   bg: 'bg-service-amber',   label: 'Amarelo' },
+  { id: 'indigo',  bg: 'bg-service-indigo',  label: 'Roxo' },
+  { id: 'rose',    bg: 'bg-service-rose',    label: 'Rosa' },
+  { id: 'violet',  bg: 'bg-service-violet',  label: 'Violeta' },
+  { id: 'sky',     bg: 'bg-service-sky',     label: 'Azul' },
+  { id: 'orange',  bg: 'bg-service-orange',  label: 'Laranja' },
+];
+
 export function Services() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [services, setServices] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [currency, setCurrency] = useState('$'); // Moeda padrão
+  const [currency, setCurrency] = useState('$');
   
   // Estados do Formulário
   const [editingService, setEditingService] = useState(null); 
   const [name, setName] = useState('');
   const [price, setPrice] = useState('');
   const [duration, setDuration] = useState('30');
+  const [color, setColor] = useState('emerald'); // Cor padrão
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -1675,22 +1780,9 @@ export function Services() {
 
   const loadServices = async () => {
     try {
-      // 1. BUSCA O PERFIL PARA DEFINIR A MOEDA DINÂMICA
       const profile = await getProfessionalProfile();
-      if (profile) {
-        // Se o perfil já tiver a moeda salva (como configuramos no Registro/Profile), usamos ela.
-        // Caso contrário, mantemos o fallback baseado no país para contas antigas.
-        if (profile.currency) {
-          setCurrency(profile.currency);
-        } else {
-          let fallbackCurrency = '$'; 
-          if (profile.country === 'BR') fallbackCurrency = 'R$';
-          if (profile.country === 'PT') fallbackCurrency = '€';
-          setCurrency(fallbackCurrency);
-        }
-      }
-
-      // 2. BUSCA A LISTA DE SERVIÇOS
+      if (profile?.currency) setCurrency(profile.currency);
+      
       const data = await getServices();
       setServices(data);
     } catch (error) {
@@ -1700,21 +1792,21 @@ export function Services() {
     }
   };
 
-  // Abre o modal para CRIAR (Preservado)
   const handleNewService = () => {
     setEditingService(null);
     setName('');
     setPrice('');
     setDuration('30');
+    setColor('emerald');
     setIsModalOpen(true);
   };
 
-  // Abre o modal para EDITAR (Preservado)
   const handleEditService = (service) => {
     setEditingService(service);
     setName(service.name);
     setPrice(service.price.toString());
     setDuration(service.duration.toString());
+    setColor(service.color || 'emerald');
     setIsModalOpen(true);
   };
 
@@ -1725,7 +1817,8 @@ export function Services() {
       const serviceData = {
         name,
         price: parseFloat(price),
-        duration: parseInt(duration)
+        duration: parseInt(duration),
+        color // Salvamos a cor escolhida
       };
 
       if (editingService) {
@@ -1744,7 +1837,7 @@ export function Services() {
   };
 
   const handleDelete = async (id) => {
-    if (confirm("Are you sure you want to delete this service?")) {
+    if (confirm("Deseja realmente excluir este serviço?")) {
       await deleteService(id);
       loadServices();
     }
@@ -1752,48 +1845,56 @@ export function Services() {
 
   return (
     <AppLayout>
-      <header className="flex items-center justify-between mb-8">
+      <header className="flex items-center justify-between mb-10">
         <div>
-          <h1 className="text-2xl font-bold text-barber-white">My Services</h1>
-          <p className="text-barber-gray text-sm">Manage your catalog and pricing</p>
+          <h1 className="text-3xl font-black text-schedy-black tracking-tighter uppercase italic">Meus Serviços</h1>
+          <p className="text-schedy-gray text-xs font-bold uppercase tracking-widest">Catálogo e Precificação</p>
         </div>
-        <Button className="w-auto gap-2" onClick={handleNewService}>
-          <Plus size={20} /> New Service
+        <Button className="w-auto gap-2 h-12 px-6 shadow-vivid" onClick={handleNewService}>
+          <Plus size={20} /> Novo Serviço
         </Button>
       </header>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {loading ? (
-          <p className="text-barber-gray animate-pulse">Loading services...</p>
+          <div className="col-span-3 py-20 flex justify-center">
+            <div className="w-8 h-8 border-4 border-schedy-black border-t-transparent rounded-full animate-spin"></div>
+          </div>
         ) : services.length === 0 ? (
-          <div className="col-span-3 text-center py-10 text-barber-gray border border-dashed border-zinc-800 rounded-xl">
-            No services registered yet.
+          <div className="col-span-3 text-center py-20 bg-white border-2 border-dashed border-schedy-border rounded-[32px]">
+            <p className="text-schedy-gray font-bold uppercase tracking-widest text-sm">Nenhum serviço cadastrado.</p>
           </div>
         ) : (
           services.map((service) => (
-            <div key={service.id} className="bg-barber-black border border-zinc-800 p-5 rounded-2xl flex justify-between items-center group hover:border-barber-gold transition-all shadow-lg">
-              <div>
-                <h3 className="font-bold text-barber-white text-lg">{service.name}</h3>
-                <div className="flex gap-4 mt-2 text-sm text-barber-gray">
-                  {/* EXIBIÇÃO DA MOEDA DINÂMICA */}
-                  <span className="flex items-center gap-1 font-medium text-barber-gold">
-                    <DollarSign size={14}/> {currency}{service.price}
+            <div 
+              key={service.id} 
+              className="bg-white border border-schedy-border p-6 rounded-[32px] flex justify-between items-center group hover:shadow-premium transition-all relative overflow-hidden"
+            >
+              {/* Barra de cor lateral - O toque UAU */}
+              <div className={`absolute left-0 top-0 bottom-0 w-2 bg-service-${service.color || 'emerald'}`} />
+
+              <div className="pl-2">
+                <h3 className="font-black text-schedy-black text-xl tracking-tight uppercase italic">{service.name}</h3>
+                <div className="flex gap-4 mt-3 text-xs font-black uppercase tracking-widest">
+                  <span className={`text-service-${service.color || 'emerald'} flex items-center gap-1`}>
+                    {currency}{service.price}
                   </span>
-                  <span className="flex items-center gap-1">
-                    <Clock size={14}/> {service.duration} min
+                  <span className="text-schedy-gray flex items-center gap-1">
+                    <Clock size={14}/> {service.duration} MIN
                   </span>
                 </div>
               </div>
-              <div className="flex gap-1">
+              
+              <div className="flex gap-2">
                 <button 
                   onClick={() => handleEditService(service)}
-                  className="text-zinc-500 hover:text-barber-gold transition-colors p-2 rounded-lg hover:bg-barber-gold/10"
+                  className="p-3 bg-schedy-canvas text-schedy-black rounded-2xl hover:bg-schedy-black hover:text-white transition-all"
                 >
                   <Pencil size={18} />
                 </button>
                 <button 
                   onClick={() => handleDelete(service.id)}
-                  className="text-zinc-500 hover:text-red-500 transition-colors p-2 rounded-lg hover:bg-red-500/10"
+                  className="p-3 bg-red-50 text-schedy-danger rounded-2xl hover:bg-schedy-danger hover:text-white transition-all"
                 >
                   <Trash2 size={18} />
                 </button>
@@ -1806,21 +1907,20 @@ export function Services() {
       <Modal 
         isOpen={isModalOpen} 
         onClose={() => setIsModalOpen(false)}
-        title={editingService ? "Edit Service" : "New Service"}
+        title={editingService ? "Editar Serviço" : "Novo Serviço"}
       >
-        <form onSubmit={handleSave} className="flex flex-col gap-4">
+        <form onSubmit={handleSave} className="flex flex-col gap-6">
           <Input 
-            label="Service Name" 
-            placeholder="Ex: Haircut" 
+            label="Nome do Serviço" 
+            placeholder="Ex: Corte Degradê" 
             value={name}
             onChange={e => setName(e.target.value)}
             required
           />
           
           <div className="flex gap-4">
-            {/* LABEL DA MOEDA DINÂMICA NO INPUT */}
             <Input 
-              label={`Price (${currency})`} 
+              label={`Preço (${currency})`} 
               type="number" 
               step="0.01" 
               placeholder="30.00" 
@@ -1829,24 +1929,42 @@ export function Services() {
               required
             />
             <div className="w-full">
-              <label className="text-sm text-barber-gray font-medium mb-1 block">Duration</label>
+              <label className="text-[10px] text-schedy-gray font-black uppercase tracking-widest mb-2 block">Duração</label>
               <select 
-                className="w-full bg-barber-black border border-zinc-800 rounded-lg p-3 text-barber-white focus:border-barber-gold outline-none transition-all"
+                className="w-full bg-schedy-canvas border border-schedy-border rounded-xl p-3 text-sm font-bold focus:border-schedy-black outline-none appearance-none"
                 value={duration}
                 onChange={e => setDuration(e.target.value)}
               >
-                <option value="15">15 min</option>
-                <option value="30">30 min</option>
-                <option value="45">45 min</option>
-                <option value="60">1 hour</option>
-                <option value="90">1h 30min</option>
-                <option value="120">2 hours</option>
+                {[15, 30, 45, 60, 90, 120].map(m => (
+                    <option key={m} value={m}>{m === 60 ? '1 HORA' : m > 60 ? '1H 30MIN' : `${m} MIN`}</option>
+                ))}
               </select>
             </div>
           </div>
 
-          <Button type="submit" loading={saving} className="mt-4 h-14 font-bold uppercase tracking-widest">
-            {editingService ? "Update Service" : "Create Service"}
+          {/* SELETOR DE CORES VIVAS */}
+          <div>
+            <label className="text-[10px] text-schedy-gray font-black uppercase tracking-widest mb-3 block">Identificador Visual (Cor do Card)</label>
+            <div className="grid grid-cols-7 gap-3">
+              {SERVICE_COLORS.map((c) => (
+                <button
+                  key={c.id}
+                  type="button"
+                  onClick={() => setColor(c.id)}
+                  className={`
+                    h-10 rounded-xl transition-all flex items-center justify-center
+                    ${c.bg} 
+                    ${color === c.id ? 'ring-4 ring-schedy-black scale-110 shadow-lg' : 'opacity-60 hover:opacity-100'}
+                  `}
+                >
+                  {color === c.id && <Check size={20} className="text-white" />}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <Button type="submit" loading={saving} className="mt-4 h-16 text-lg font-black uppercase italic tracking-tighter shadow-vivid">
+            {editingService ? "Atualizar Catálogo" : "Salvar Serviço"}
           </Button>
         </form>
       </Modal>
@@ -2301,41 +2419,33 @@ import { Button } from '../components/ui/Button';
 import { 
   Globe, 
   Loader2, 
-  CheckCircle, 
   Copy, 
   Check, 
   Download,
-  ShieldCheck,
   Zap,
   MapPin,
-  Lock,
-  ExternalLink
+  ExternalLink,
+  ShieldCheck,
+  QrCode
 } from 'lucide-react';
 import { QRCodeCanvas } from 'qrcode.react'; 
 import { provisionConciergeNumber, getProfessionalProfile } from '../services/professionalService'; 
 
-// Opções de Area Codes dos EUA
 const US_AREA_CODES = [
   { code: '305', city: 'Miami, FL' },
   { code: '212', city: 'New York, NY' },
   { code: '407', city: 'Orlando, FL' },
   { code: '702', city: 'Las Vegas, NV' },
   { code: '832', city: 'Houston, TX' },
-  { code: 'random', city: 'Instant Allocation' },
+  { code: 'random', city: 'Alocação Instantânea' },
 ];
 
-// Dicionário de Mensagens Localizadas
 const COUNTRY_MESSAGES = {
   US: { text: "Hello! I'd like to schedule an appointment with {NAME}.", lang: "en" },
-  GB: { text: "Hello! I'd like to schedule an appointment with {NAME}.", lang: "en" },
   BR: { text: "Olá! Gostaria de agendar um horário com {NAME}.", lang: "pt-BR" },
   PT: { text: "Olá! Gostaria de marcar um serviço com {NAME}.", lang: "pt-PT" },
-  ES: { text: "¡Hola! Quisiera reservar una cita con {NAME}.", lang: "es" },
-  FR: { text: "Bonjour ! Je voudrais prendre rendez-vous avec {NAME}.", lang: "fr" },
-  IT: { text: "Ciao! Vorrei prenotare un appuntamento con {NAME}.", lang: "it" }
 };
 
-// Número global do Concierge (Deve bater com o do backend)
 const CONCIERGE_NUMBER = "+14454563363"; 
 
 export function SetupPro() {
@@ -2352,18 +2462,11 @@ export function SetupPro() {
         const data = await getProfessionalProfile();
         if (data && data.plan === 'pro') {
           setProfile(data);
-          
-          // CORREÇÃO: Verifica a ativação pela existência do timestamp de ativação
-          // Isso resolve o problema do campo 'phone' vir vazio do Firestore
           if (data.numberActivatedAt && data.numberCountry === 'US') {
              setIsActivated(true);
           }
         }
-      } catch (error) {
-        console.error("Error fetching profile:", error);
-      } finally {
-        setPageLoading(false);
-      }
+      } catch (error) { console.error(error); } finally { setPageLoading(false); }
     }
     loadProfile();
   }, []);
@@ -2373,12 +2476,7 @@ export function SetupPro() {
     try {
       await provisionConciergeNumber({ areaCode: selectedAreaCode }); 
       setIsActivated(true);
-    } catch (error) {
-      console.error(error);
-      alert("Error activating Concierge. Our team has been notified.");
-    } finally {
-      setActivationLoading(false);
-    }
+    } catch (error) { alert("Erro na ativação."); } finally { setActivationLoading(false); }
   };
 
   const copyToClipboard = (text) => {
@@ -2390,9 +2488,9 @@ export function SetupPro() {
   if (pageLoading) {
     return (
       <AppLayout>
-        <div className="flex flex-col items-center justify-center mt-40 gap-4">
-          <Loader2 className="animate-spin text-barber-gold" size={48} />
-          <p className="text-barber-gray animate-pulse font-bold uppercase tracking-widest text-xs">Syncing with US Infrastructure...</p>
+        <div className="flex flex-col items-center justify-center py-40 gap-4">
+          <Loader2 className="animate-spin text-schedy-black" size={48} />
+          <p className="text-schedy-gray font-black uppercase tracking-[0.3em] text-[10px]">Configurando Infraestrutura US...</p>
         </div>
       </AppLayout>
     );
@@ -2401,65 +2499,77 @@ export function SetupPro() {
   if (!profile || profile.plan !== 'pro') {
      return (
       <AppLayout>
-        <div className="max-w-md mx-auto mt-20 text-center bg-zinc-900 border border-zinc-800 p-10 rounded-3xl shadow-2xl">
-          <Zap className="text-barber-gold mx-auto mb-4" size={48} />
-          <h2 className="text-white font-black text-2xl mb-2 uppercase italic tracking-tighter">AI Concierge Required</h2>
-          <p className="text-zinc-500 text-sm mb-8 italic">You need an active Pro Plan to provision your International US (+1) Number.</p>
-          <Button onClick={() => window.location.href = '/pricing'} className="w-full">Upgrade Now</Button>
+        <div className="max-w-md mx-auto mt-20 text-center bg-white border border-schedy-border p-12 rounded-[40px] shadow-premium">
+          <Zap className="text-schedy-black mx-auto mb-6" size={48} />
+          <h2 className="text-schedy-black font-black text-2xl mb-3 uppercase italic tracking-tighter">Plano Pro Necessário</h2>
+          <p className="text-schedy-gray text-sm mb-8 font-medium leading-relaxed">Você precisa de um plano ativo para provisionar seu número internacional e ativar a IA.</p>
+          <Button onClick={() => window.location.href = '/pricing'}>Ver Planos</Button>
         </div>
       </AppLayout>
      );
   }
 
-  // --- LÓGICA DE GERAÇÃO DO LINK ---
   const identifier = profile.slug || profile.id;
   const businessName = profile.barberShopName || profile.name;
   const localeConfig = COUNTRY_MESSAGES[profile.country] || COUNTRY_MESSAGES.US;
-  
   const localizedText = localeConfig.text.replace('{NAME}', businessName);
-  
-  // CORREÇÃO: Usamos o formato (ID: identifier) para bater com a REGEX do backend
   const initialMessage = `${localizedText} (ID: ${identifier})`;
-  
-  // Fallback para o número fixo do Concierge caso o campo phone do perfil esteja vazio
   const cleanConcierge = CONCIERGE_NUMBER.replace(/\D/g, '');
   const whatsappLink = `https://wa.me/${cleanConcierge}?text=${encodeURIComponent(initialMessage)}`;
 
-  // VIEW 1: ESTADO INICIAL (ATIVAÇÃO)
+  const PageHeader = (
+    <header className="flex items-center justify-between mb-8 bg-white p-6 rounded-[24px] border border-schedy-border shadow-sm">
+        <div className="flex items-center gap-4">
+          <div className="bg-schedy-black p-2.5 rounded-xl text-white">
+            <Globe size={20} />
+          </div>
+          <div>
+            <h1 className="text-xl font-black text-schedy-black tracking-tighter uppercase italic leading-none">AI Concierge</h1>
+            <p className="text-[10px] font-bold text-schedy-gray uppercase tracking-widest mt-1">Status da Operação Internacional</p>
+          </div>
+        </div>
+        {isActivated && (
+          <div className="flex items-center gap-2 bg-green-50 px-4 py-2 rounded-xl border border-green-100">
+            <span className="w-2 h-2 bg-green-500 rounded-full animate-ping" />
+            <span className="text-[10px] font-black uppercase text-green-600 italic">Live & Active</span>
+          </div>
+        )}
+    </header>
+  );
+
   if (!isActivated) {
     return (
         <AppLayout>
-            <div className="max-w-2xl mx-auto mt-6 animate-in fade-in slide-in-from-bottom-4 duration-700">
-                <div className="bg-barber-black border border-zinc-800 p-8 md:p-12 rounded-3xl shadow-2xl relative overflow-hidden">
-                    <div className="absolute top-0 right-0 p-4 opacity-10">
-                        <Globe size={120} />
+            {PageHeader}
+            <div className="max-w-3xl mx-auto animate-in fade-in slide-in-from-bottom-4 duration-700">
+                <div className="bg-white border-2 border-schedy-border p-10 rounded-[48px] shadow-premium relative overflow-hidden text-center">
+                    <div className="mb-10">
+                      <h2 className="text-4xl font-black text-schedy-black tracking-tighter uppercase italic mb-4">
+                        Ative sua Autoridade <span className="text-service-indigo">Global</span>
+                      </h2>
+                      <p className="text-schedy-gray font-medium max-w-lg mx-auto">
+                        Seu Concierge será provisionado instantaneamente com uma linha virtual dos Estados Unidos (+1) para máxima estabilidade.
+                      </p>
                     </div>
 
-                    <div className="flex flex-col gap-2 mb-10">
-                      <h1 className="text-4xl font-black text-barber-white tracking-tighter uppercase italic">
-                        Activate <span className="text-barber-gold">Global</span> Authority
-                      </h1>
-                      <p className="text-zinc-500 font-medium italic">Your AI Concierge will be provisioned with an instant US (+1) virtual line.</p>
-                    </div>
-
-                    <div className="bg-zinc-900/50 p-6 rounded-2xl border border-zinc-800 mb-8">
-                      <label className="text-[10px] font-black text-barber-gold uppercase tracking-[0.2em] mb-4 block italic">
-                        Select International Area Code
+                    <div className="bg-schedy-canvas/50 p-8 rounded-[32px] border border-schedy-border mb-10 text-left">
+                      <label className="text-[10px] font-black text-schedy-black uppercase tracking-[0.2em] mb-6 flex items-center gap-2">
+                        <MapPin size={12} /> Selecione o Código de Área (EUA)
                       </label>
-                      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
                         {US_AREA_CODES.map((item) => (
                           <button
                             key={item.code}
                             type="button"
                             onClick={() => setSelectedAreaCode(item.code)}
-                            className={`p-4 rounded-xl border text-left transition-all duration-300 ${
+                            className={`p-5 rounded-2xl border-2 transition-all duration-300 text-left ${
                               selectedAreaCode === item.code 
-                              ? 'bg-barber-gold border-barber-gold text-black shadow-lg shadow-barber-gold/20' 
-                              : 'bg-black border-zinc-800 text-zinc-500 hover:border-zinc-700'
+                              ? 'bg-schedy-black border-schedy-black text-white shadow-vivid scale-105' 
+                              : 'bg-white border-schedy-border text-schedy-gray hover:border-schedy-black hover:text-schedy-black'
                             }`}
                           >
-                            <p className="text-xl font-black italic">{item.code === 'random' ? 'ANY' : item.code}</p>
-                            <p className="text-[10px] font-bold uppercase opacity-80 truncate">{item.city}</p>
+                            <p className="text-2xl font-black italic">{item.code === 'random' ? 'ANY' : item.code}</p>
+                            <p className="text-[9px] font-bold uppercase opacity-80">{item.city}</p>
                           </button>
                         ))}
                       </div>
@@ -2468,9 +2578,9 @@ export function SetupPro() {
                     <Button 
                         onClick={handleActivate} 
                         loading={activationLoading} 
-                        className="w-full h-16 text-xl font-black italic uppercase tracking-tighter shadow-xl shadow-barber-gold/5"
+                        className="h-20 text-xl shadow-vivid"
                     >
-                        {activationLoading ? "Provisioning US Line..." : "Activate International Concierge"}
+                        {activationLoading ? "Provisionando Linha US..." : "Ativar Concierge Internacional"}
                     </Button>
                 </div>
             </div>
@@ -2478,86 +2588,86 @@ export function SetupPro() {
     );
   }
 
-  // VIEW 2: ESTADO ATIVADO (QR CODE E LINKS)
   return (
     <AppLayout>
-      <div className="max-w-4xl mx-auto mt-6 animate-in zoom-in-95 duration-500">
-        <div className="bg-barber-black border-2 border-barber-gold p-8 md:p-12 rounded-[40px] shadow-2xl relative overflow-hidden">
+      {PageHeader}
+      <div className="max-w-5xl mx-auto animate-in zoom-in-95 duration-500">
+        <div className="bg-white border-2 border-schedy-black p-10 md:p-16 rounded-[60px] shadow-premium relative overflow-hidden">
           
-          <div className="absolute top-6 right-8 flex items-center gap-2 bg-green-500/10 text-green-500 px-4 py-1.5 rounded-full border border-green-500/20">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-            </span>
-            <span className="text-[10px] font-black uppercase tracking-widest italic">Live & Operational</span>
-          </div>
-
-          <div className="text-center mb-12">
-            <h1 className="text-4xl font-black text-barber-white uppercase italic tracking-tighter mb-2">Concierge <span className="text-barber-gold">Deployed</span></h1>
-            <p className="text-zinc-500 font-medium italic">Your US-based AI is now handling your WhatsApp schedule.</p>
-          </div>
-
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-16 items-center">
             
-            {/* QR CODE SECTION */}
             <div className="flex flex-col items-center">
-                <div className="bg-white p-6 rounded-[32px] shadow-2xl mb-6 relative group">
-                    <QRCodeCanvas 
-                        id="qr-concierge"
-                        value={whatsappLink} 
-                        size={220}
-                        level={"H"}
-                        includeMargin={false}
-                    />
+                <div className="bg-schedy-canvas p-10 rounded-[48px] shadow-inner mb-8 relative group border border-schedy-border/50">
+                    <div className="bg-white p-6 rounded-[32px] shadow-premium">
+                      <QRCodeCanvas 
+                          id="qr-concierge"
+                          value={whatsappLink} 
+                          size={240}
+                          level={"H"}
+                      />
+                    </div>
+                    <div className="absolute -top-4 -right-4 bg-schedy-black text-white p-4 rounded-full shadow-vivid rotate-12">
+                      <QrCode size={24} />
+                    </div>
                 </div>
-                <Button variant="outline" className="w-auto h-10 text-[10px]" onClick={() => {
+                <Button variant="outline" className="w-auto h-12 px-8" onClick={() => {
                     const canvas = document.getElementById('qr-concierge');
                     const url = canvas.toDataURL("image/png");
                     const link = document.createElement('a');
-                    link.download = `my-ai-qr.png`;
+                    link.download = `meu-concierge-ia.png`;
                     link.href = url;
                     link.click();
                 }}>
-                    <Download size={14} className="mr-2" /> Download PNG
+                    <Download size={18} className="mr-2" /> Baixar Kit Digital (PNG)
                 </Button>
             </div>
 
-            {/* DETAILS SECTION */}
-            <div className="space-y-6">
-                <div className="bg-zinc-900/80 p-6 rounded-2xl border border-zinc-800">
-                    <label className="text-[10px] font-black text-zinc-500 uppercase mb-2 block tracking-widest italic">Dedicated International Line</label>
-                    <span className="text-3xl font-black text-barber-gold tracking-tighter italic">{CONCIERGE_NUMBER}</span>
+            <div className="space-y-8">
+                <div>
+                  <h2 className="text-4xl font-black text-schedy-black uppercase italic tracking-tighter mb-2">Concierge Ativo.</h2>
+                  <p className="text-schedy-gray font-medium">Sua inteligência artificial já está operando na rede global do WhatsApp.</p>
                 </div>
 
-                <div className="bg-zinc-900/80 p-6 rounded-2xl border border-zinc-800">
-                    <label className="text-[10px] font-black text-zinc-500 uppercase mb-2 block tracking-widest italic">Your Smart Booking Link</label>
+                <div className="bg-schedy-canvas p-6 rounded-[24px] border border-schedy-border/50">
+                    {/* CORREÇÃO: Removido 'block' aqui */}
+                    <label className="text-[10px] font-black text-schedy-gray uppercase mb-3 tracking-widest italic flex items-center gap-2">
+                      <ShieldCheck size={14} /> Linha Internacional Dedicada
+                    </label>
+                    <span className="text-4xl font-black text-schedy-black tracking-tighter italic">{CONCIERGE_NUMBER}</span>
+                </div>
+
+                <div className="bg-schedy-canvas p-6 rounded-[24px] border border-schedy-border/50">
+                    {/* CORREÇÃO: Removido 'block' aqui */}
+                    <label className="text-[10px] font-black text-schedy-gray uppercase mb-3 tracking-widest italic flex items-center gap-2">
+                      Your Smart Booking Link
+                    </label>
                     <div className="flex items-center gap-3">
-                        <div className="bg-black/50 text-[10px] text-zinc-400 w-full p-4 rounded-xl truncate font-mono border border-zinc-800/50 italic">
+                        <div className="bg-white text-[10px] text-schedy-black w-full p-4 rounded-xl truncate font-mono border border-schedy-border shadow-sm italic">
                             {whatsappLink}
                         </div>
                         <button 
                             type="button"
                             onClick={() => copyToClipboard(whatsappLink)}
-                            className="p-4 bg-barber-gold text-black rounded-xl hover:scale-105 transition-all shadow-lg"
+                            className="p-4 bg-schedy-black text-white rounded-2xl hover:scale-110 transition-all shadow-vivid shrink-0"
                         >
                             {copied ? <Check size={20} /> : <Copy size={20} />}
                         </button>
                     </div>
                 </div>
-            </div>
-          </div>
 
-          <div className="mt-12 pt-8 border-t border-zinc-800 flex flex-col sm:flex-row gap-4">
-            <Button onClick={() => window.location.href = '/dashboard'} className="flex-1 h-14 uppercase font-black italic tracking-tighter">
-              Manage Calendar
-            </Button>
-            <Button 
-                onClick={() => window.open(whatsappLink, '_blank')} 
-                variant="outline" 
-                className="flex-1 h-14 uppercase font-black italic tracking-tighter gap-2"
-            >
-              Test AI Chat <ExternalLink size={16} />
-            </Button>
+                <div className="flex flex-col sm:flex-row gap-4 pt-4">
+                  <Button onClick={() => window.location.href = '/dashboard'} className="flex-1 h-16 shadow-vivid">
+                    Gerenciar Agenda
+                  </Button>
+                  <Button 
+                      onClick={() => window.open(whatsappLink, '_blank')} 
+                      variant="outline" 
+                      className="flex-1 h-16 gap-2"
+                  >
+                    Testar Chat IA <ExternalLink size={18} />
+                  </Button>
+                </div>
+            </div>
           </div>
         </div>
       </div>
@@ -2857,81 +2967,52 @@ export function Terms() {
 import React from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { 
-  Calendar, 
-  LogOut, 
-  User, 
-  Zap, 
-  ShieldAlert, 
-  FileText, 
-  Briefcase, 
-  Users,
-  MessageSquare,
-  Sparkles,
-  BarChart3,
-  CreditCard,
-  TrendingUp,
-  HelpCircle,
-  X,
-  ShieldCheck,
-  Clock,
-  LayoutDashboard,
-  Settings,
-  Bell,    // Ícone para Notificações
-  QrCode   // Ícone para Compartilhar/QR
+  Calendar, LogOut, User, Zap, ShieldAlert, FileText, 
+  Briefcase, Users, MessageSquare, Sparkles, BarChart3, 
+  CreditCard, TrendingUp, HelpCircle, X, Bell, QrCode,
+  ChevronRight, ChevronLeft, Menu
 } from 'lucide-react';
 import { signOut } from 'firebase/auth';
 import { auth } from '../../services/firebase';
 import { useAuth } from '../../contexts/AuthContext'; 
 import { PWAInstallButton } from './PWAInstallButton';
 
-export function Sidebar({ onClose }) {
+export function Sidebar({ isCollapsed, toggleCollapse, onCloseMobile }) {
   const location = useLocation(); 
   const navigate = useNavigate();
   const { profile } = useAuth(); 
 
-  // DEFINIÇÃO DE PERMISSÕES
   const isAdmin = profile?.role === 'admin';
   const isPro = profile?.plan === 'pro';
   const isSales = profile?.role === 'sales';
 
-  // --- CONSTRUÇÃO DINÂMICA DO MENU ---
   let menuItems = [];
 
   if (isAdmin) {
-    // MENU ADMIN (DONO DO SAAS)
     menuItems = [
       { path: '/admin', icon: ShieldAlert, label: 'Management' },      
-      { path: '/admin-dashboard', icon: BarChart3, label: 'BI Analytics' },
-      { path: '/profile', icon: User, label: 'My Admin Profile' },
-      { path: '/support', icon: HelpCircle, label: 'Help Center' },
-      { path: '/terms', icon: FileText, label: 'Legal' },
+      { path: '/admin-dashboard', icon: BarChart3, label: 'Analytics' },
+      { path: '/profile', icon: User, label: 'Settings' },
     ];
   } else if (isSales) {
-    // MENU COMERCIAL (VENDEDOR)
-    // O QR Code do vendedor já fica dentro do "Sales Console"
     menuItems = [
-      { path: '/sales-console', icon: TrendingUp, label: 'Sales Console' },
-      { path: '/sales-crm', icon: Users, label: 'My Network' },
-      { path: '/sales-analytics', icon: BarChart3, label: 'Performance' },
-      { path: '/profile', icon: User, label: 'My Profile' },
-      { path: '/support', icon: HelpCircle, label: 'Help Center' },
-      { path: '/terms', icon: FileText, label: 'Legal' },
+      { path: '/sales-console', icon: TrendingUp, label: 'Dashboard' },
+      { path: '/sales-crm', icon: Users, label: 'Network' },
+      { path: '/sales-analytics', icon: BarChart3, label: 'Reports' },
+      { path: '/profile', icon: User, label: 'Profile' },
     ];
   } else {
-    // MENU PROFISSIONAL (BARBEIRO)
     menuItems = [
       { path: '/dashboard', icon: Calendar, label: 'Schedule' },
-      { path: '/notifications', icon: Bell, label: 'Inbox & Alerts' }, // Nova: Notificações da IA
+      { path: '/notifications', icon: Bell, label: 'Inbox' },
       { path: '/messages', icon: MessageSquare, label: 'Live Chat' },
       { path: '/customers', icon: Users, label: 'Customers' },
       { path: '/services', icon: Briefcase, label: 'Services' },
-      { path: '/setup-pro', icon: QrCode, label: 'My Link & QR' }, // Nova: Local para baixar o QR Code
+      { path: '/setup-pro', icon: QrCode, label: 'My QR' },
       { path: '/profile', icon: User, label: 'Profile' },
       isPro 
         ? { path: '/billing', icon: CreditCard, label: 'Billing' }
         : { path: '/pricing', icon: Zap, label: 'Plans' },
-      { path: '/support', icon: HelpCircle, label: 'Help Center' },
-      { path: '/terms', icon: FileText, label: 'Legal' },
     ];
   }
 
@@ -2941,86 +3022,101 @@ export function Sidebar({ onClose }) {
   };
 
   return (
-    <aside className="w-64 bg-barber-black border-r border-zinc-800 flex flex-col h-full shadow-2xl">
+    <div className="flex flex-col h-full bg-white relative">
       
-      {/* HEADER DA SIDEBAR DINÂMICO */}
-      <div className="h-20 flex items-center justify-between px-6 border-b border-zinc-800">
-        <div className="flex items-center gap-2">
-            <Sparkles className={isAdmin ? "text-barber-red" : "text-barber-gold"} size={20} />
-            <h1 className="text-xl font-black text-barber-white tracking-tighter uppercase italic">
-              {isAdmin ? 'SCHEDY ADMIN' : isSales ? 'SCHEDY PARTNER' : 'SCHEDY'}
-            </h1>
+      {/* Botão para Expandir/Retrair (Apenas Desktop) */}
+      <button 
+        onClick={toggleCollapse}
+        className="hidden lg:flex absolute -right-3 top-10 w-6 h-6 bg-schedy-black text-white rounded-full items-center justify-center shadow-vivid z-50 hover:scale-110 transition-transform"
+      >
+        {isCollapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
+      </button>
+
+      {/* HEADER: LOGO */}
+      <div className={`h-16 flex items-center ${isCollapsed ? 'justify-center' : 'px-6'} border-b border-schedy-border shrink-0`}>
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 bg-schedy-black text-white rounded-lg flex items-center justify-center font-black italic text-xs shrink-0">
+            S
+          </div>
+          {!isCollapsed && (
+            <span className="font-black text-xl tracking-tighter text-schedy-black animate-in fade-in slide-in-from-left-2">
+              SCHEDY
+            </span>
+          )}
         </div>
-        
-        <button 
-          onClick={onClose} 
-          className="lg:hidden p-2 text-zinc-500 hover:text-white transition-colors"
-        >
-          <X size={24} />
-        </button>
       </div>
 
-      {/* NAVEGAÇÃO PRINCIPAL */}
-      <nav className="flex-1 py-6 flex flex-col gap-2 px-3 overflow-y-auto custom-scrollbar">
+      {/* NAVEGAÇÃO */}
+      <nav className="flex-1 py-6 flex flex-col gap-1 px-3 overflow-y-auto custom-scrollbar">
         {menuItems.map((item) => {
           const isActive = location.pathname === item.path;
           return (
             <Link
               key={item.path}
               to={item.path}
-              onClick={onClose}
-              className={`flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 ${
-                isActive 
-                  ? 'bg-barber-red text-white shadow-lg shadow-red-900/30 translate-x-1' 
-                  : 'text-barber-gray hover:bg-zinc-800/50 hover:text-white font-medium'
-              }`}
+              onClick={onCloseMobile}
+              title={isCollapsed ? item.label : ''}
+              className={`
+                flex items-center gap-3 px-3 py-3 rounded-xl transition-all duration-200 group
+                ${isActive 
+                  ? 'bg-schedy-black text-white shadow-vivid' 
+                  : 'text-schedy-gray hover:bg-schedy-canvas hover:text-schedy-black'
+                }
+                ${isCollapsed ? 'justify-center' : 'justify-start'}
+              `}
             >
-              <item.icon size={20} />
-              <span className="font-bold uppercase tracking-tight italic text-sm">{item.label}</span>
+              <item.icon size={20} className={isActive ? 'text-white' : 'group-hover:scale-110 transition-transform'} />
+              {!isCollapsed && (
+                <span className="font-bold uppercase tracking-tight text-[11px] whitespace-nowrap animate-in fade-in slide-in-from-left-2">
+                  {item.label}
+                </span>
+              )}
             </Link>
           );
         })}
       </nav>
 
-      {/* ÁREA INFERIOR: IDENTIFICAÇÃO DO USUÁRIO */}
-      <div className="p-4 border-t border-zinc-800 flex flex-col gap-4">
+      {/* FOOTER: PROFILE & LOGOUT */}
+      <div className="p-3 border-t border-schedy-border flex flex-col gap-2">
         
-        <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 shadow-inner">
-          <div className="flex items-center gap-3">
-            <div className={`w-10 h-10 rounded-full flex items-center justify-center text-black font-black italic shadow-lg shrink-0 ${isAdmin ? 'bg-barber-red' : 'bg-barber-gold'}`}>
-              {profile?.name?.charAt(0).toUpperCase() || 'U'}
-            </div>
-            <div className="min-w-0">
-              <p className="text-[11px] font-black text-white uppercase truncate italic leading-tight">
+        {/* Profile Card */}
+        <div className={`
+          flex items-center gap-3 rounded-2xl transition-all
+          ${isCollapsed ? 'justify-center p-1' : 'bg-schedy-canvas p-3'}
+        `}>
+          <div className={`
+            rounded-xl flex items-center justify-center font-black text-white shadow-sm shrink-0
+            ${isAdmin ? 'bg-schedy-danger' : 'bg-schedy-black'}
+            ${isCollapsed ? 'w-10 h-10 text-xs' : 'w-9 h-9 text-[10px]'}
+          `}>
+            {profile?.name?.charAt(0).toUpperCase() || 'U'}
+          </div>
+          
+          {!isCollapsed && (
+            <div className="min-w-0 animate-in fade-in slide-in-from-left-2">
+              <p className="text-[10px] font-black text-schedy-black uppercase truncate leading-tight">
                 {profile?.name || 'User'}
               </p>
-              <p className="text-[9px] text-zinc-500 truncate font-medium">
+              <p className="text-[9px] text-schedy-gray truncate">
                 {profile?.email}
               </p>
             </div>
-          </div>
-
-          <div className="mt-3 flex items-center gap-1.5">
-            <div className={`w-1.5 h-1.5 rounded-full ${
-              isAdmin ? 'bg-barber-red' : profile?.status === 'active' ? 'bg-green-500' : 'bg-barber-gold animate-pulse'
-            }`} />
-            <span className="text-[8px] font-black uppercase tracking-[0.2em] text-zinc-400 italic">
-              {isAdmin ? 'System Owner' : `Account: ${profile?.status === 'active' ? 'Verified' : 'Pending'}`}
-            </span>
-          </div>
+          )}
         </div>
-
-        <PWAInstallButton />
 
         <button 
           onClick={handleLogout}
-          className="w-full flex items-center gap-3 px-4 py-3 text-zinc-500 hover:text-red-500 hover:bg-red-500/10 rounded-xl transition-all font-bold uppercase italic text-sm"
+          title={isCollapsed ? 'Log Out' : ''}
+          className={`
+            flex items-center gap-3 px-3 py-3 text-schedy-gray hover:text-schedy-danger hover:bg-red-50 rounded-xl transition-all font-bold uppercase text-[10px]
+            ${isCollapsed ? 'justify-center' : 'justify-start'}
+          `}
         >
           <LogOut size={20} />
-          <span>Log Out</span>
+          {!isCollapsed && <span className="animate-in fade-in slide-in-from-left-2">Sign Out</span>}
         </button>
       </div>
-    </aside>
+    </div>
   );
 }
 ```
@@ -3030,57 +3126,95 @@ export function Sidebar({ onClose }) {
 ```javascript
 import React, { useState } from 'react';
 import { Sidebar } from './Sidebar';
-import { Menu, X } from 'lucide-react';
-import { SupportChat } from './SupportChat'; // Importamos o novo chat
+import { Menu } from 'lucide-react';
+import { SupportChat } from './SupportChat';
 
 export function AppLayout({ children }) {
-  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  // Estado Desktop: Começa fechada (apenas ícones) para foco total no conteúdo
+  const [isCollapsed, setIsCollapsed] = useState(true);
+  
+  // Estado Mobile: Controle do menu hambúrguer (Overlay)
+  const [isMobileOpen, setIsMobileOpen] = useState(false);
+
+  const toggleSidebar = () => setIsCollapsed(!isCollapsed);
 
   return (
-    <div className="min-h-screen bg-barber-dark text-barber-white flex">
-      {/* Overlay para fechar o menu ao clicar fora (Mobile) */}
-      {isSidebarOpen && (
+    // Fundo claro de alto contraste (schedy-canvas)
+    <div className="flex h-screen bg-schedy-canvas text-schedy-black font-sans overflow-hidden">
+      
+      {/* Overlay Mobile: Escurece o fundo quando o menu abre no celular */}
+      {isMobileOpen && (
         <div 
-          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-40 lg:hidden"
-          onClick={() => setIsSidebarOpen(false)}
+          className="fixed inset-0 bg-schedy-black/20 backdrop-blur-sm z-[60] lg:hidden"
+          onClick={() => setIsMobileOpen(false)}
         />
       )}
 
-      {/* Sidebar */}
-      <div className={`
-        fixed inset-y-0 left-0 z-50 transform transition-transform duration-300 ease-in-out
-        lg:relative lg:translate-x-0
-        ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
-      `}>
-        <Sidebar onClose={() => setIsSidebarOpen(false)} />
-      </div>
+      {/* 
+          SIDEBAR CONTAINER 
+          Z-Index alto (z-50) para garantir que fique acima de tudo, exceto modais.
+      */}
+      <aside 
+        className={`
+          fixed inset-y-0 left-0 z-50 h-full bg-white border-r border-schedy-border shadow-premium
+          transition-all duration-300 ease-in-out
+          /* Comportamento Mobile: Ocupa 280px e desliza */
+          ${isMobileOpen ? 'translate-x-0 w-[280px]' : '-translate-x-full lg:translate-x-0'}
+          /* Largura Dinâmica no Desktop */
+          lg:${isCollapsed ? 'w-[72px]' : 'w-[240px]'}
+        `}
+      >
+        <Sidebar 
+          isCollapsed={isCollapsed} 
+          toggleCollapse={toggleSidebar}
+          onCloseMobile={() => setIsMobileOpen(false)}
+        />
+      </aside>
       
-      {/* Conteúdo Principal */}
-      <main className="flex-1 w-full min-w-0 flex flex-col h-screen overflow-hidden">
-        {/* Header Mobile */}
-        <div className="lg:hidden flex items-center justify-between p-4 border-b border-zinc-800 bg-barber-black/50 backdrop-blur-md">
+      {/* 
+          ÁREA PRINCIPAL (MAIN)
+          O segredo do Layout Enterprise: Margem dinâmica (ml) no desktop.
+          Isso impede que qualquer conteúdo fique atrás da sidebar.
+      */}
+      <main 
+        className={`
+          flex-1 flex flex-col min-w-0 h-screen relative transition-all duration-300
+          /* Margem à esquerda que "empurra" o conteúdo para fora da área da sidebar */
+          lg:${isCollapsed ? 'ml-[72px]' : 'ml-[240px]'}
+        `}
+      >
+        
+        {/* Header Mobile: Visível apenas em telas pequenas */}
+        <div className="lg:hidden h-16 bg-white border-b border-schedy-border flex items-center justify-between px-6 shrink-0 z-30">
           <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-barber-gold rounded-lg flex items-center justify-center text-black font-black italic text-xs">SC</div>
-            <span className="font-black uppercase tracking-tighter italic text-sm">Schedy</span>
+            <div className="w-8 h-8 bg-schedy-black text-white rounded-lg flex items-center justify-center font-black italic text-xs">
+              S
+            </div>
+            <span className="font-black text-lg tracking-tighter text-schedy-black">SCHEDY</span>
           </div>
           <button 
-            onClick={() => setIsSidebarOpen(true)}
-            className="p-2 text-barber-gold hover:bg-zinc-800 rounded-lg transition-colors"
+            onClick={() => setIsMobileOpen(true)}
+            className="p-2 hover:bg-schedy-canvas rounded-lg transition-colors text-schedy-black"
           >
             <Menu size={24} />
           </button>
         </div>
 
-        {/* Área do Conteúdo com Scroll Independente */}
-        <div className="flex-1 overflow-y-auto p-3 md:p-8 custom-scrollbar">
-          <div className="max-w-7xl mx-auto">
+        {/* 
+            VIEWPORT DE CONTEÚDO 
+            Ocupa 100% da largura disponível após a margem da sidebar.
+        */}
+        <div className="flex-1 overflow-y-auto overflow-x-hidden p-4 md:p-6 custom-scrollbar">
+          <div className="w-full h-full flex flex-col">
             {children}
           </div>
         </div>
       </main>
 
-      {/* AGENTE DE IA GLOBAL (Aparece em todas as páginas) */}
-      <SupportChat />
+      {/* Agente IA (Flutuante com Z-Index altíssimo) */}
+      <div className="relative z-[100]">
+        <SupportChat />
+      </div>
     </div>
   );
 }
@@ -3092,21 +3226,20 @@ export function AppLayout({ children }) {
 import React, { useEffect } from 'react';
 import { X } from 'lucide-react';
 
-export function Modal({ isOpen, onClose, title, children }) {
+/**
+ * Modal Component - Schedy Premium UI
+ * Foco: Largura generosa (Wide Layout), Header/Footer fixos e Contraste Máximo.
+ */
+export function Modal({ isOpen, onClose, title, children, footer }) {
   
-  // BLOQUEIO DE SCROLL DO FUNDO:
-  // Impede que a tela de trás (calendário) se mova enquanto o modal está aberto.
+  // BLOQUEIO DE SCROLL DO FUNDO
   useEffect(() => {
     if (isOpen) {
       document.body.style.overflow = 'hidden';
     } else {
       document.body.style.overflow = 'unset';
     }
-    
-    // Limpeza ao fechar ou desmontar o componente
-    return () => {
-      document.body.style.overflow = 'unset';
-    };
+    return () => { document.body.style.overflow = 'unset'; };
   }, [isOpen]);
 
   if (!isOpen) return null;
@@ -3114,30 +3247,49 @@ export function Modal({ isOpen, onClose, title, children }) {
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
       
-      {/* Fundo escuro (clicar nele fecha o modal) */}
+      {/* Overlay com Blur Elegante */}
       <div 
-        className="absolute inset-0 bg-black/90 backdrop-blur-sm transition-opacity"
+        className="absolute inset-0 bg-schedy-black/20 backdrop-blur-md transition-opacity"
         onClick={onClose}
       ></div>
 
-      {/* A Janela do Modal - Agora com altura máxima e flexbox para permitir scroll interno */}
-      <div className="relative w-full max-w-md bg-barber-black border border-zinc-800 rounded-2xl shadow-2xl flex flex-col max-h-[90vh] animate-in fade-in zoom-in duration-200">
+      {/* 
+         JANELA DO MODAL:
+         - max-w-2xl: Aumentamos a largura para comportar agendamentos manuais
+         - bg-white: Agora no padrão Light de alto contraste
+      */}
+      <div className="relative w-full max-w-2xl bg-white border border-schedy-border rounded-[32px] shadow-vivid flex flex-col max-h-[90vh] animate-in fade-in zoom-in duration-300 overflow-hidden">
         
-        {/* Cabeçalho Fixo no Topo */}
-        <div className="flex items-center justify-between p-6 border-b border-zinc-800/50">
-          <h2 className="text-xl font-black text-barber-white uppercase italic tracking-tighter">{title}</h2>
+        {/* 1. CABEÇALHO (FIXO) */}
+        <div className="flex items-center justify-between p-8 border-b border-schedy-border bg-white z-10">
+          <div className="flex flex-col">
+            <h2 className="text-2xl font-black text-schedy-black uppercase italic tracking-tighter leading-none">
+              {title}
+            </h2>
+            <div className="h-1 w-12 bg-schedy-black mt-2 rounded-full" />
+          </div>
+          
           <button 
             onClick={onClose}
-            className="text-barber-gray hover:text-white transition-colors p-1.5 bg-zinc-900 rounded-lg"
+            className="text-schedy-gray hover:text-schedy-black transition-all p-2 bg-schedy-canvas rounded-xl hover:rotate-90"
           >
             <X size={20} />
           </button>
         </div>
 
-        {/* Área de Conteúdo (Formulário) - Onde o scroll acontece */}
-        <div className="flex-1 overflow-y-auto p-6 custom-scrollbar">
-          {children}
+        {/* 2. ÁREA DE CONTEÚDO (SCROLL INTERNO) */}
+        <div className="flex-1 overflow-y-auto p-8 custom-scrollbar bg-white">
+          <div className="space-y-6">
+            {children}
+          </div>
         </div>
+
+        {/* 3. RODAPÉ (FIXO - Se houver botões passados via prop) */}
+        {footer && (
+          <div className="p-8 border-t border-schedy-border bg-schedy-canvas/30 z-10">
+            {footer}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -3149,19 +3301,33 @@ export function Modal({ isOpen, onClose, title, children }) {
 ```javascript
 import React from 'react';
 
-// Este componente aceita:
-// - children: o texto dentro do botão
-// - variant: 'primary' (vermelho) ou 'outline' (borda dourada)
-// - loading: se for true, mostra "Carregando..." e desabilita
-// - ...props: qualquer outra coisa (como onClick)
-export function Button({ children, variant = 'primary', loading, className = '', ...props }) {
+/**
+ * Button Component - Schedy Premium UI
+ * Foco: Alto contraste, tipografia editorial e feedback tátil.
+ */
+export function Button({ 
+  children, 
+  variant = 'primary', 
+  loading, 
+  className = '', 
+  ...props 
+}) {
   
-  const baseStyles = "w-full py-3 px-4 rounded font-bold transition-all duration-200 flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed";
+  // Base: Cantos arredondados premium, tipografia itálica pesada e tracking apertado
+  const baseStyles = "w-full py-4 px-6 rounded-2xl font-black uppercase italic tracking-tighter transition-all duration-300 flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed active:scale-95 text-sm";
   
   const variants = {
-    primary: "bg-barber-red hover:bg-red-700 text-white shadow-lg shadow-red-900/20",
-    outline: "border border-barber-gold text-barber-gold hover:bg-barber-gold hover:text-barber-black",
-    ghost: "text-barber-gray hover:text-white"
+    // Principal: Preto sólido (contraste total no fundo claro)
+    primary: "bg-schedy-black text-white shadow-vivid hover:bg-schedy-gray",
+    
+    // Outline: Borda de 2px preta, fundo transparente (Inverte no hover)
+    outline: "border-2 border-schedy-black text-schedy-black bg-transparent hover:bg-schedy-black hover:text-white",
+    
+    // Ghost: Para ações secundárias, apenas texto e hover suave
+    ghost: "text-schedy-gray hover:text-schedy-black hover:bg-schedy-canvas",
+    
+    // Danger: Para exclusão (Vermelho Vivo)
+    danger: "bg-schedy-danger text-white hover:bg-red-700 shadow-sm"
   };
 
   return (
@@ -3171,7 +3337,10 @@ export function Button({ children, variant = 'primary', loading, className = '',
       {...props}
     >
       {loading ? (
-        <span className="animate-pulse">Processando...</span>
+        <div className="flex items-center gap-2">
+          <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
+          <span className="animate-pulse">Sincronizando...</span>
+        </div>
       ) : children}
     </button>
   );
@@ -3183,17 +3352,48 @@ export function Button({ children, variant = 'primary', loading, className = '',
 ```javascript
 import React from 'react';
 
-// Este componente já vem com o Label (o título acima do campo)
+/**
+ * Input Component - Schedy Premium UI
+ * Foco: Legibilidade imediata, estados de foco nítidos e contraste absoluto.
+ */
 export function Input({ label, type = "text", error, ...props }) {
   return (
-    <div className="flex flex-col gap-1 w-full">
-      {label && <label className="text-sm text-barber-gray font-medium">{label}</label>}
-      <input 
-        type={type}
-        className={`bg-barber-black border border-zinc-800 rounded p-3 text-barber-white focus:outline-none focus:border-barber-gold transition-colors placeholder:text-zinc-700 ${error ? 'border-red-500' : ''}`}
-        {...props}
-      />
-      {error && <span className="text-xs text-red-500">{error}</span>}
+    <div className="flex flex-col gap-1.5 w-full group">
+      {label && (
+        <label className="text-[10px] font-black text-schedy-gray uppercase tracking-[0.2em] ml-1 group-focus-within:text-schedy-black transition-colors">
+          {label}
+        </label>
+      )}
+      
+      <div className="relative">
+        <input 
+          type={type}
+          className={`
+            w-full bg-schedy-canvas border-2 rounded-2xl p-4 
+            text-schedy-black font-bold text-sm
+            placeholder:text-schedy-gray/50 
+            transition-all duration-200 outline-none
+            /* Estado Normal: Borda sutil */
+            ${error ? 'border-schedy-danger' : 'border-schedy-border'}
+            /* Estado Foco: Borda preta e leve elevação */
+            focus:border-schedy-black focus:bg-white focus:shadow-sm
+          `}
+          {...props}
+        />
+        
+        {/* Indicador visual de erro (Ícone de exclamação opcional ou apenas borda) */}
+        {error && (
+          <div className="absolute right-4 top-1/2 -translate-y-1/2 text-schedy-danger">
+             <span className="text-xs font-black">!</span>
+          </div>
+        )}
+      </div>
+
+      {error && (
+        <span className="text-[10px] font-bold text-schedy-danger uppercase tracking-widest ml-1 animate-in fade-in slide-in-from-top-1">
+          {error}
+        </span>
+      )}
     </div>
   );
 }
@@ -3202,17 +3402,22 @@ export function Input({ label, type = "text", error, ...props }) {
 
 --- ARQUIVO: src/components/calendar/DayView.jsx ---
 ```javascript
-import React, { useState, useEffect, useRef } from 'react';
-import { DndContext, useSensor, useSensors, PointerSensor } from '@dnd-kit/core';
+import React, { useRef } from 'react';
+import { DndContext, useSensor, useSensors, PointerSensor, MouseSensor, TouchSensor } from '@dnd-kit/core';
 import { 
   hoursArray, 
   getNewStartTime, 
   START_HOUR, 
-  getNowPosition, 
-  getPositionFromTime 
+  getPositionFromTime,
+  PIXELS_PER_HOUR
 } from '../../utils/timeGrid'; 
 import { AppointmentCard } from './AppointmentCard';
-import { addDays, format, isSameDay, setHours, setMinutes } from 'date-fns';
+import { addDays, format, isSameDay, setHours, setMinutes, startOfWeek } from 'date-fns';
+import { ptBR } from 'date-fns/locale';
+import { ChevronLeft, ChevronRight, Calendar as CalendarIcon, Filter } from 'lucide-react';
+
+// MEDIDA DE OURO: A largura da coluna de horas deve ser idêntica em todos os níveis
+const TIME_COLUMN_WIDTH = 'w-16 md:w-20'; 
 
 export function DayView({ 
   appointments, 
@@ -3221,87 +3426,36 @@ export function DayView({
   onTimeSlotClick, 
   onComplete, 
   onDelete,   
-  startDate = new Date(), 
+  startDate = new Date(),
+  onNavigate,
   businessHours,
-  timezone = "America/New_York"
+  timezone = "Europe/Lisbon"
 }) {
   const scrollContainerRef = useRef(null);
-  const [numDays, setNumDays] = useState(1);
-  const [nowPos, setNowPos] = useState(0);
-  const [currentTimeStr, setCurrentTimeStr] = useState(""); 
-  const [pxPerHour, setPxPerHour] = useState(90);
-  const [containerHeight, setContainerHeight] = useState(0);
+  const firstDayOfWeek = startOfWeek(startDate, { weekStartsOn: 0 });
+  const days = Array.from({ length: 7 }, (_, i) => addDays(firstDayOfWeek, i));
 
-  // 1. Ajuste de Responsividade e Escala
-  useEffect(() => {
-    const updateLayout = () => {
-      setNumDays(window.innerWidth >= 768 ? 3 : 1);
-      if (scrollContainerRef.current) {
-        const height = scrollContainerRef.current.offsetHeight;
-        setContainerHeight(height);
-        setPxPerHour(height / 10); 
-      }
-    };
-
-    updateLayout();
-    window.addEventListener('resize', updateLayout);
-    return () => window.removeEventListener('resize', updateLayout);
-  }, []);
-
-  // 2. Lógica da "Agulha Fixa" + Relógio Digital + Auto-Scroll
-  useEffect(() => {
-    const updateNowAndScroll = () => {
-      const now = new Date();
-      
-      const pos = getNowPosition(timezone, pxPerHour);
-      setNowPos(pos);
-
-      const timeStr = new Intl.DateTimeFormat('pt-BR', {
-        timeZone: timezone,
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false
-      }).format(now);
-      setCurrentTimeStr(timeStr);
-      
-      const todayInTimezone = new Date(now.toLocaleString("en-US", {timeZone: timezone}));
-      const isViewingToday = isSameDay(startDate, todayInTimezone);
-      
-      if (isViewingToday && scrollContainerRef.current) {
-        const targetScroll = pos - (containerHeight * 0.3);
-        
-        scrollContainerRef.current.scrollTo({
-          top: targetScroll,
-          behavior: 'smooth'
-        });
-      }
-    };
-
-    updateNowAndScroll();
-    const interval = setInterval(updateNowAndScroll, 10000); 
-    return () => clearInterval(interval);
-  }, [pxPerHour, containerHeight, timezone, startDate]);
-
-  const days = Array.from({ length: numDays }, (_, i) => addDays(startDate, i));
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
+  const sensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 10 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } })
+  );
 
   const handleDragEnd = (event) => {
     const { active, delta } = event;
     if (!delta.y) return;
     const appointment = active.data.current;
-    const newStartTime = getNewStartTime(appointment.startTime, delta.y, pxPerHour);
+    const newStartTime = getNewStartTime(appointment.startTime, delta.y, PIXELS_PER_HOUR);
     if (onAppointmentMove) onAppointmentMove(appointment.id, newStartTime);
   };
 
   const handleGridClick = (e, dayDate) => {
     if (e.target.closest('[data-appointment-card]')) return;
     const rect = e.currentTarget.getBoundingClientRect();
-    const offsetY = e.clientY - rect.top + e.currentTarget.scrollTop; 
-    const hoursPassed = offsetY / pxPerHour;
+    const offsetY = e.clientY - rect.top; 
+    const hoursPassed = offsetY / PIXELS_PER_HOUR;
     const hour = Math.floor(hoursPassed) + START_HOUR;
     const minutes = Math.floor((hoursPassed % 1) * 60);
     const roundedMinutes = Math.round(minutes / 15) * 15;
-    
     let clickedDate = setHours(dayDate, hour);
     clickedDate = setMinutes(clickedDate, roundedMinutes);
     clickedDate.setSeconds(0);
@@ -3311,131 +3465,112 @@ export function DayView({
 
   const getTop = (timeStr) => {
     if (!timeStr || timeStr === "none") return 0;
-    return getPositionFromTime(`2000-01-01T${timeStr}:00`, pxPerHour);
+    return getPositionFromTime(`2026-01-01T${timeStr}:00`, PIXELS_PER_HOUR);
   };
 
   return (
     <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
-      <div className="w-full bg-barber-black border border-zinc-800 rounded-xl overflow-hidden flex flex-col h-full shadow-2xl relative border-t-barber-gold/20">
+      <div className="flex flex-col h-full bg-white rounded-[24px] border border-schedy-border shadow-premium overflow-hidden transition-all">
         
-        <div className="bg-zinc-900/95 backdrop-blur-xl border-b border-zinc-800 flex divide-x divide-zinc-800 z-30">
-           <div className="w-16 flex-shrink-0 bg-zinc-900/50"></div>
-           {days.map((day, index) => (
-             <div key={index} className="flex-1 p-3 text-center">
-               <span className="block text-[10px] text-zinc-500 uppercase font-black tracking-widest">{format(day, 'EEEE')}</span>
-               <span className={`block font-black text-lg ${isSameDay(day, new Date()) ? 'text-barber-gold' : 'text-white'}`}>
-                 {format(day, 'MMM dd')}
-               </span>
-             </div>
-           ))}
+        {/* 1. HEADER SLIM (ESTILO AVEC) - Reduzido de h-20 para h-14 */}
+        <div className="flex items-center justify-between px-6 h-14 border-b border-schedy-border shrink-0 bg-white z-30">
+          <div className="flex items-center gap-3">
+            <span className="text-sm font-black uppercase italic tracking-tighter text-schedy-black">
+              {format(firstDayOfWeek, 'MMMM yyyy', { locale: ptBR })}
+            </span>
+          </div>
+          
+          <div className="flex items-center gap-2">
+            <div className="flex items-center bg-schedy-canvas p-1 rounded-xl border border-schedy-border">
+                <button onClick={() => onNavigate(addDays(startDate, -7))} className="p-1.5 hover:bg-white rounded-lg text-schedy-black transition-all">
+                    <ChevronLeft size={16} />
+                </button>
+                <button onClick={() => onNavigate(new Date())} className="px-3 text-[9px] font-black uppercase tracking-widest text-schedy-black">
+                    Hoje
+                </button>
+                <button onClick={() => onNavigate(addDays(startDate, 7))} className="p-1.5 hover:bg-white rounded-lg text-schedy-black transition-all">
+                    <ChevronRight size={16} />
+                </button>
+            </div>
+            <button className="p-2 bg-schedy-canvas border border-schedy-border rounded-xl text-schedy-gray hover:text-schedy-black transition-all">
+                <Filter size={16} />
+            </button>
+          </div>
         </div>
 
-        <div 
-          ref={scrollContainerRef}
-          className="flex-1 overflow-y-auto relative custom-scrollbar select-none"
-          style={{ scrollBehavior: 'smooth' }}
-        >
-          <div className="flex relative" style={{ height: hoursArray.length * pxPerHour }}>
-            
-            {/* Linha de Tempo (Agulha) */}
-            <div 
-              className="absolute left-0 w-full z-20 pointer-events-none flex items-center transition-all duration-1000 ease-linear"
-              style={{ top: nowPos }}
-            >
-              <div className="w-16 flex justify-end pr-2">
-                <div className="bg-barber-gold text-black text-[11px] font-extrabold px-2 py-0.5 rounded shadow-[0_0_15px_rgba(197,160,89,0.5)] flex items-center gap-1.5 min-w-[58px] justify-center">
-                  <span className="relative flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-black opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-black"></span>
-                  </span>
-                  {currentTimeStr}
-                </div>
+        {/* 2. DIAS DA SEMANA (HEADER DA GRADE) - Alinhamento Matemático */}
+        <div className="flex border-b border-schedy-border bg-white z-20 shadow-sm">
+          <div className={`${TIME_COLUMN_WIDTH} shrink-0 border-r border-schedy-border bg-schedy-canvas/10`} />
+          <div className="flex-1 grid grid-cols-7">
+            {days.map((day, index) => (
+              <div key={index} className="py-2 text-center border-r border-schedy-border last:border-r-0">
+                <span className="block text-[8px] font-black text-schedy-gray uppercase tracking-widest">
+                  {format(day, 'EEE', { locale: ptBR })}
+                </span>
+                <span className={`
+                  inline-flex items-center justify-center w-7 h-7 rounded-full font-black text-xs mt-0.5
+                  ${isSameDay(day, new Date()) ? 'bg-schedy-black text-white' : 'text-schedy-black'}
+                `}>
+                  {format(day, 'dd')}
+                </span>
               </div>
-              <div className="flex-1 border-t-2 border-barber-gold shadow-[0_0_20px_rgba(197,160,89,0.4)]"></div>
-            </div>
+            ))}
+          </div>
+        </div>
 
-            {/* Coluna de Horas (Lateral) */}
-            <div className="w-16 flex-shrink-0 bg-zinc-900/40 border-r border-zinc-800 relative z-10 pointer-events-none">
+        {/* 3. ÁREA DA GRADE (SCROLL) */}
+        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto relative bg-white select-none custom-scrollbar">
+          <div className="flex relative" style={{ height: hoursArray.length * PIXELS_PER_HOUR }}>
+            
+            {/* EIXO DE HORAS (FIXO) */}
+            <div className={`${TIME_COLUMN_WIDTH} shrink-0 border-r border-schedy-border bg-white sticky left-0 z-10 shadow-[2px_0_5px_rgba(0,0,0,0.02)]`}>
               {hoursArray.map((hour) => (
                 <div 
                   key={hour} 
-                  className="absolute w-full text-right pr-3 text-[10px] font-black text-zinc-600 -mt-2.5" 
-                  style={{ top: (hour - START_HOUR) * pxPerHour }}
+                  className="absolute w-full text-center text-[9px] font-black text-schedy-gray/50 -mt-2.5" 
+                  style={{ top: (hour - START_HOUR) * PIXELS_PER_HOUR }}
                 >
                   {hour.toString().padStart(2, '0')}:00
                 </div>
               ))}
             </div>
 
-            {/* Colunas de Dias */}
-            {days.map((day, colIndex) => {
-              const dayAppointments = appointments.filter(apt => isSameDay(new Date(apt.startTime), day));
-
-              return (
-                <div 
-                  key={colIndex} 
-                  className="flex-1 relative border-r border-zinc-800/50 last:border-r-0 cursor-cell hover:bg-white/[0.02] transition-colors" 
-                  onClick={(e) => handleGridClick(e, day)}
-                >
-                  {/* Faixas de Horário Comercial (Abertura/Fechamento) */}
-                  {businessHours && (
-                    <>
-                      <div className="absolute w-full bg-black/50 z-0 pointer-events-none" style={{ top: 0, height: getTop(businessHours.open) }} />
-                      <div className="absolute w-full bg-black/50 z-0 pointer-events-none" style={{ top: getTop(businessHours.close), bottom: 0 }} />
-                      
-                      {/* LÓGICA DO BREAK (PAUSA) */}
-                      {businessHours.break && businessHours.break !== "none" && (
-                        (() => {
-                          const [bStart, bEnd] = businessHours.break.split('-');
-                          const bTop = getTop(bStart);
-                          const bBottom = getTop(bEnd);
-                          return (
-                            <div
-                              className="absolute w-full bg-zinc-800/40 z-0 pointer-events-none flex items-center justify-center border-y border-zinc-700/20"
-                              style={{ top: bTop, height: bBottom - bTop }}
-                            >
-                              <span className="text-[9px] font-black uppercase tracking-[0.3em] text-zinc-600 italic">Pause / Break</span>
-                            </div>
-                          );
-                        })()
-                      )}
-                    </>
-                  )}
-
-                  {/* Linhas Horizontais do Grid */}
-                  {hoursArray.map((hour) => (
+            {/* COLUNAS DOS DIAS (GRID REAL) */}
+            <div className="flex-1 grid grid-cols-7 h-full">
+                {days.map((day, colIndex) => {
+                  const dayAppointments = appointments.filter(apt => isSameDay(new Date(apt.startTime), day));
+                  return (
                     <div 
-                      key={hour} 
-                      className="absolute w-full border-b border-zinc-800/40 pointer-events-none" 
-                      style={{ top: (hour - START_HOUR) * pxPerHour, height: pxPerHour }} 
-                    />
-                  ))}
-
-                  {/* Renderização dos Cards de Agendamento */}
-                  {dayAppointments.map((apt) => (
-                    <div key={apt.id} data-appointment-card>
-                        <AppointmentCard 
-                          appointment={apt} 
-                          customPxPerHour={pxPerHour}
-                          onComplete={onComplete} 
-                          onDelete={onDelete}     
-                          onClick={(e) => { 
-                            e.stopPropagation(); 
-                            if (onAppointmentClick) onAppointmentClick(apt); 
-                          }} 
+                      key={colIndex} 
+                      className="relative border-r border-schedy-border last:border-r-0 hover:bg-schedy-canvas/20 transition-colors" 
+                      onClick={(e) => handleGridClick(e, day)}
+                    >
+                      {/* LINHAS HORIZONTAIS DE FUNDO */}
+                      {hoursArray.map((hour) => (
+                        <div 
+                          key={hour} 
+                          className="absolute w-full border-b border-schedy-border/30" 
+                          style={{ top: (hour - START_HOUR) * PIXELS_PER_HOUR, height: PIXELS_PER_HOUR }} 
                         />
+                      ))}
+
+                      {/* CARDS */}
+                      {dayAppointments.map((apt) => (
+                        <div key={apt.id} data-appointment-card>
+                            <AppointmentCard 
+                                appointment={apt} 
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    onAppointmentClick(apt);
+                                }}
+                            />
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
-              );
-            })}
+                  );
+                })}
+            </div>
           </div>
-        </div>
-        
-        <div className="bg-barber-black p-2 text-center border-t border-zinc-800 z-30">
-            <p className="text-[9px] text-barber-gold font-black uppercase tracking-[0.3em] animate-pulse">
-              System Live • Polling Active (10s) • {timezone}
-            </p>
         </div>
       </div>
     </DndContext>
@@ -3449,23 +3584,27 @@ export function DayView({
 import React from 'react';
 import { useDraggable } from '@dnd-kit/core';
 import { CSS } from '@dnd-kit/utilities';
-import { AlertCircle, Lock } from 'lucide-react'; 
+import { AlertCircle, Lock, Phone } from 'lucide-react'; 
 import { 
   getPositionFromTime, 
   getHeightFromDuration, 
   getNewStartTime,    
-  formatTimeDisplay   
+  formatTimeDisplay,
+  PIXELS_PER_HOUR
 } from '../../utils/timeGrid';
 
-export function AppointmentCard({ appointment, onClick, style: propStyle, customPxPerHour }) {
+export function AppointmentCard({ appointment, onClick }) {
   
-  const top = getPositionFromTime(appointment.startTime, customPxPerHour);
-  const height = getHeightFromDuration(appointment.duration, customPxPerHour);
+  // Cálculo de posição e altura baseados no novo grid de 100px/hora
+  const top = getPositionFromTime(appointment.startTime, PIXELS_PER_HOUR);
+  const height = getHeightFromDuration(appointment.duration, PIXELS_PER_HOUR);
+  
   const isCompleted = appointment.status === 'completed';
   const isBlocked = appointment.type === 'block'; 
-  
-  // Verifica se existem notas/observações para ativar o alerta
   const hasNotes = appointment.notes && appointment.notes.trim().length > 0;
+  
+  // Cor dinâmica vinda do Firestore (campo color do serviço)
+  const serviceColor = appointment.color || 'emerald';
 
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: appointment.id,
@@ -3473,95 +3612,93 @@ export function AppointmentCard({ appointment, onClick, style: propStyle, custom
     disabled: isCompleted 
   });
 
+  // Feedback visual de tempo durante o arraste
   let displayTime = formatTimeDisplay(appointment.startTime);
-  
   if (isDragging && transform) {
-    const projectedTimeISO = getNewStartTime(appointment.startTime, transform.y, customPxPerHour);
+    const projectedTimeISO = getNewStartTime(appointment.startTime, transform.y, PIXELS_PER_HOUR);
     displayTime = formatTimeDisplay(projectedTimeISO);
   }
 
-  const showDetails = height >= 35;
+  // Hierarquia visual baseada na altura do card
+  const isLarge = height >= 70; // 45min ou mais
+  const isMedium = height >= 45; // 30min
 
   const style = {
     top: `${top}px`,
-    height: `${height}px`,
+    height: `${height - 2}px`, // Pequeno gap entre cards
     zIndex: isDragging ? 100 : 10, 
     transform: CSS.Translate.toString(transform),
-    opacity: isDragging ? 0.9 : (isCompleted ? 0.6 : 1), 
     position: 'absolute',
     left: '4px',  
     right: '4px', 
     touchAction: 'none',
-    ...propStyle 
   };
 
   return (
     <div
       ref={setNodeRef}
       style={style}
-      // hover:z-[50] garante que o card focado fique visualmente acima dos outros
-      className="group hover:z-[50] transition-all duration-75"
+      className="group"
     >
-      {/* 
-          BARRA FLUTUANTE REMOVIDA 
-          A edição agora é feita exclusivamente clicando no card abaixo.
-      */}
-
-      {/* CARD PRINCIPAL - CLICÁVEL PARA ABRIR O MODAL */}
       <div
         {...listeners}
         {...attributes}
-        onClick={(e) => {
-          // IMPORTANTE: Passamos o evento 'e' para o onClick original do DayView
-          if (onClick) onClick(e);
-        }}
+        onClick={(e) => onClick(e)}
         className={`
-          w-full h-full rounded-lg border-l-4 transition-all duration-200 overflow-hidden relative
+          w-full h-full rounded-2xl transition-all duration-200 overflow-hidden relative shadow-sm
           ${isDragging 
-            ? 'bg-barber-gold text-barber-black border-barber-white shadow-2xl scale-[1.02] cursor-grabbing'
+            ? 'ring-4 ring-schedy-black shadow-vivid scale-[1.02] z-[100] cursor-grabbing'
             : isCompleted
-              ? 'bg-zinc-900 border-zinc-700 cursor-default'
+              ? 'bg-schedy-border opacity-40 grayscale cursor-default'
               : isBlocked
-                ? 'bg-zinc-900/80 border-zinc-500 hover:bg-zinc-800 cursor-pointer' 
-                : hasNotes 
-                  ? 'bg-zinc-800 border-barber-gold animate-pulse-gold shadow-[0_0_15px_rgba(197,160,89,0.3)]' 
-                  : 'bg-zinc-800/90 border-barber-red hover:bg-zinc-700 cursor-pointer shadow-md'
+                ? 'bg-schedy-gray border-2 border-dashed border-schedy-border cursor-not-allowed'
+                : `bg-service-${serviceColor} hover:shadow-vivid hover:-translate-y-0.5 cursor-pointer`
           }
         `}
       >
-        {/* pointer-events-none garante que o clique seja detectado pelo container pai */}
-        <div className="flex justify-between items-center p-2 relative h-full w-full pointer-events-none">
-          {/* Badge Visual de Notas */}
-          {hasNotes && !isCompleted && !isDragging && (
-            <div className="absolute top-1 right-1 text-barber-gold">
-              <AlertCircle size={10} fill="currentColor" className="text-black" />
-            </div>
-          )}
+        <div className="p-3 flex flex-col h-full pointer-events-none text-white">
+          
+          {/* TOPO: Hora e Alerta */}
+          <div className="flex justify-between items-start mb-1">
+            <span className={`font-black tracking-tighter italic ${isLarge ? 'text-sm' : 'text-[10px]'}`}>
+              {displayTime}
+            </span>
+            {hasNotes && !isDragging && (
+              <AlertCircle size={isMedium ? 14 : 10} className="text-white/80" />
+            )}
+          </div>
 
-          <div className={`flex flex-col justify-center min-w-0 ${isDragging ? 'opacity-20' : ''}`}>
-            <h4 className={`font-bold text-sm leading-tight truncate flex items-center gap-1.5 ${isCompleted ? 'text-zinc-500 line-through' : 'text-barber-white'}`}>
-              {isBlocked && <Lock size={12} className="text-zinc-500" />}
+          {/* MEIO: Nome do Cliente */}
+          <div className="min-w-0 flex-1">
+            <h4 className={`font-black uppercase italic leading-tight truncate ${isLarge ? 'text-sm' : 'text-[11px]'}`}>
+              {isBlocked && <Lock size={12} className="inline mr-1" />}
               {appointment.clientName}
             </h4>
-            {showDetails && (
-              <p className={`text-[10px] mt-0.5 truncate ${isCompleted ? 'text-zinc-600' : 'text-barber-gray'}`}>
+            
+            {/* DETALHES: Serviço e Telefone (Apenas se houver espaço) */}
+            {isMedium && (
+              <p className="text-[9px] font-bold opacity-90 uppercase truncate mt-0.5">
                 {appointment.serviceName}
               </p>
             )}
           </div>
 
-          <div className={`flex flex-col items-end flex-shrink-0 ml-2 ${isDragging ? 'opacity-20' : ''}`}>
-            {showDetails && !isCompleted && !isBlocked && (
-              <span className={`text-[9px] font-black px-1.5 py-0.5 rounded ${hasNotes ? 'bg-barber-gold text-black' : 'bg-barber-black/50 text-barber-gold'}`}>
-                ${appointment.price}
+          {/* RODAPÉ: Telefone (Apenas se for card grande) */}
+          {isLarge && appointment.clientPhone && (
+            <div className="flex items-center gap-1 mt-auto pt-1 border-t border-white/20">
+              <Phone size={8} />
+              <span className="text-[8px] font-bold tabular-nums">
+                {appointment.clientPhone}
               </span>
-            )}
-            {!isDragging && (
-              <span className={`text-[10px] mt-1 ${isCompleted ? 'text-zinc-600' : 'text-barber-white font-bold'}`}>
-                {displayTime}
-              </span>
-            )}
-          </div>
+            </div>
+          )}
+
+          {/* Overlay de Concluído */}
+          {isCompleted && (
+            <div className="absolute inset-0 bg-white/20 flex items-center justify-center">
+               <span className="text-[10px] font-black uppercase text-schedy-black bg-white px-2 py-1 rounded-lg">Done</span>
+            </div>
+          )}
         </div>
       </div>
     </div>

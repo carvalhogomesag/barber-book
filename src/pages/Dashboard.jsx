@@ -5,7 +5,7 @@ import { AppointmentModal } from '../components/dashboard/AppointmentModal';
 import { BlockModal } from '../components/dashboard/BlockModal';
 import { Button } from '../components/ui/Button';
 import { Plus, Lock, Sun } from 'lucide-react';
-import { format, addDays, isSameDay, isBefore, startOfWeek, endOfWeek } from 'date-fns';
+import { format, isSameDay, startOfWeek, endOfWeek } from 'date-fns';
 import { 
   getServices, 
   addAppointment, 
@@ -18,14 +18,14 @@ import {
 } from '../services/professionalService'; 
 
 export function Dashboard() {
-  // --- DATA STATES ---
+  // --- ESTADOS DE DADOS ---
   const [profile, setProfile] = useState(null);
   const [selectedDate, setSelectedDate] = useState(new Date());
   const [appointments, setAppointments] = useState([]);
   const [services, setServices] = useState([]);
   const [businessHours, setBusinessHours] = useState({ open: "07:00", close: "22:00", break: "12:00-13:00" });
 
-  // --- UI STATES ---
+  // --- ESTADOS DE UI ---
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isBlockModalOpen, setIsBlockModalOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -34,7 +34,7 @@ export function Dashboard() {
 
   const timezone = profile?.timezone || 'Europe/Lisbon';
 
-  // --- DATA LOADING ---
+  // --- CARREGAMENTO INICIAL ---
   useEffect(() => {
     loadInitialData();
     const interval = setInterval(refreshAppointments, 15000); 
@@ -59,7 +59,7 @@ export function Dashboard() {
   const refreshAppointments = async () => {
     try {
       const data = await getAppointments();
-      setAppointments(data);
+      setAppointments(data || []);
     } catch (error) { console.error("Fetch Error:", error); }
   };
 
@@ -68,13 +68,11 @@ export function Dashboard() {
     return new Date(new Date().toLocaleString("en-US", { timeZone: timezone }));
   };
 
-  // Mapeia a cor do serviço para o agendamento
   const appointmentsWithColors = appointments.map(apt => {
     const service = services.find(s => s.name === apt.serviceName);
     return { ...apt, color: service?.color || 'emerald' };
   });
 
-  // Filtra agendamentos para a semana inteira (Sun-Sat)
   const weekStart = startOfWeek(selectedDate, { weekStartsOn: 0 });
   const weekEnd = endOfWeek(selectedDate, { weekStartsOn: 0 });
   const filteredAppointments = appointmentsWithColors.filter(apt => {
@@ -82,11 +80,25 @@ export function Dashboard() {
     return date >= weekStart && date <= weekEnd;
   });
 
-  // --- HANDLERS ---
+  // --- HANDLERS (LÓGICA RESTAURADA) ---
+
+  // 1. Deletar Agendamento ou Bloqueio
+  const handleQuickDelete = async (id) => {
+    if (!confirm("Deseja realmente remover este item da agenda?")) return;
+    try {
+      await deleteAppointment(id);
+      await refreshAppointments();
+      setIsModalOpen(false);
+    } catch (error) { alert("Erro ao deletar."); }
+  };
+
+  // 2. Salvar Agendamento Manual
   const handleSaveAppointment = async (formData) => {
     const { clientName, selectedServiceIds, time, notes, formDate } = formData;
     const selectedData = services.filter(s => selectedServiceIds.includes(s.id));
     
+    if (selectedData.length === 0) return alert("Selecione ao menos um serviço.");
+
     const totalDuration = selectedData.reduce((acc, s) => acc + s.duration, 0);
     const totalPrice = selectedData.reduce((acc, s) => acc + s.price, 0);
     const combinedServiceName = selectedData.map(s => s.name).join(' + ');
@@ -99,17 +111,39 @@ export function Dashboard() {
         duration: totalDuration, startTime: fullStartDateStr, notes,
         status: editingAppointment ? editingAppointment.status : 'scheduled'
       };
+      
       if (editingAppointment) await updateAppointmentFull(editingAppointment.id, aptData);
       else await addAppointment(aptData);
+      
       await refreshAppointments();
       setIsModalOpen(false);
-    } catch (error) { alert("Save Error"); } 
+    } catch (error) { alert("Erro ao salvar."); } 
+    finally { setLoading(false); }
+  };
+
+  // 3. Salvar Bloqueio de Agenda
+  const handleSaveBlock = async (formData) => {
+    const { blockTime, blockDuration, blockRecurrence, blockOccurrences, blockNotes, formDate } = formData;
+    const fullStartDateStr = `${format(formDate, 'yyyy-MM-dd')}T${blockTime}:00`;
+    
+    setLoading(true);
+    try {
+      await addBlockedTime({
+        startTime: fullStartDateStr, 
+        duration: parseInt(blockDuration), 
+        notes: blockNotes,
+        recurrence: blockRecurrence, 
+        occurrences: parseInt(blockOccurrences)
+      });
+      await refreshAppointments();
+      setIsBlockModalOpen(false);
+    } catch (error) { alert("Erro ao bloquear horário."); }
     finally { setLoading(false); }
   };
 
   return (
     <AppLayout>
-      {/* HEADER MINIMALISTA DE UMA LINHA (WOW FACTOR) */}
+      {/* HEADER PREMIUM */}
       <div className="flex items-center justify-between mb-6 bg-white p-4 rounded-[24px] border border-schedy-border shadow-sm">
         <div className="flex items-center gap-6">
           <div>
@@ -122,7 +156,6 @@ export function Dashboard() {
           </div>
         </div>
 
-        {/* BOTÕES DE AÇÃO RÁPIDA */}
         <div className="flex items-center gap-2">
           <button 
             onClick={() => { setModalInitialDate(selectedDate); setIsBlockModalOpen(true); }}
@@ -139,7 +172,7 @@ export function Dashboard() {
         </div>
       </div>
 
-      {/* ÁREA DO CALENDÁRIO (OCUPA O RESTO DA TELA) */}
+      {/* CALENDÁRIO 7 DIAS */}
       <div className="flex-1 min-h-0">
         <DayView 
           appointments={filteredAppointments} 
@@ -164,7 +197,7 @@ export function Dashboard() {
         />
       </div>
 
-      {/* MODAL DE AGENDAMENTO (WIDE & NO SCROLL) */}
+      {/* MODAL DE AGENDAMENTO */}
       <AppointmentModal 
         isOpen={isModalOpen}
         onClose={() => setIsModalOpen(false)}
@@ -177,6 +210,7 @@ export function Dashboard() {
         loading={loading}
       />
 
+      {/* MODAL DE BLOQUEIO */}
       <BlockModal 
         isOpen={isBlockModalOpen}
         onClose={() => setIsBlockModalOpen(false)}
