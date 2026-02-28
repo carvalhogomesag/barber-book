@@ -108,32 +108,26 @@ const toolsDeclaration = [
 ];
 
 /**
- * FUNÇÃO AUXILIAR DE RETENTATIVA (Exponential Backoff Lite)
- * Resolve erros 503 e sobrecarga da API do Google.
+ * FUNÇÃO AUXILIAR DE RETENTATIVA
  */
 const sendMessageWithRetry = async (chat, message, retries = 2) => {
     for (let i = 0; i <= retries; i++) {
         try {
             return await chat.sendMessage(message);
         } catch (error) {
-            const isTransient = error.message.includes("503") || 
-                                error.message.includes("500") || 
-                                error.message.includes("overloaded") ||
-                                error.message.includes("Service Unavailable");
-            
+            const isTransient = error.message.includes("503") || error.message.includes("500") || error.message.includes("overloaded") || error.message.includes("Service Unavailable");
             if (isTransient && i < retries) {
-                const delay = 1000 * (i + 1); // 1s, depois 2s
-                console.warn(`[AI_RETRY] Gemini indisponível (Tentativa ${i + 1}). Aguardando ${delay}ms...`);
+                const delay = 1000 * (i + 1);
                 await new Promise(res => setTimeout(res, delay));
                 continue;
             }
-            throw error; // Erro fatal ou esgotou tentativas
+            throw error;
         }
     }
 };
 
 /**
- * LÓGICA PRINCIPAL (LLM ISOLATION + RESILIÊNCIA)
+ * LÓGICA PRINCIPAL (REFINADA COM RACIOCÍNIO DE CONFLITO)
  */
 exports.processMessageWithAI = async ({ 
     barberId, barberData, clientName, messageBody, fromNumber, 
@@ -151,49 +145,40 @@ exports.processMessageWithAI = async ({
             return "Entendido. Vou pedir para o profissional assumir agora. Só um instante! [PAUSE_AI]";
         }
 
-        // --- 2. GROUNDING & ISOLATION (FONTE ÚNICA DE VERDADE) ---
+        // --- 2. GROUNDING (FONTE ÚNICA DE VERDADE) ---
         const servicesSnap = await db.collection("barbers").doc(barberId).collection("services").get();
         const techServices = servicesSnap.docs.map(doc => `- SERVICE: "${doc.data().name}" | PRICE: ${doc.data().price} | DURATION: ${doc.data().duration}`).join('\n');
 
         const appointmentsSnap = await db.collection("barbers").doc(barberId).collection("appointments")
             .where("startTime", ">=", new Date().toISOString().split('T')[0])
             .where("status", "==", "CONFIRMED").get();
-        const busySlots = appointmentsSnap.docs.map(doc => `[BUSY] ${doc.data().startTime}`).join('\n');
+        const busySlots = appointmentsSnap.docs.map(doc => `[OCUPADO] ${doc.data().startTime}`).join('\n');
 
         const timezone = barberTimezone || barberData.timezone || "America/New_York";
         const scheduler = getSchedulerContext(timezone);
         const tools = setupTools(db, barberId, timezone, mappingRef, fromNumber);
 
-        // --- 3. MASTER PROMPT TRANSACIONAL ---
+        // --- 3. MASTER PROMPT (REGRAS DE INTEGRIDADE E SMART INTERPRETATION) ---
         const MASTER_PROMPT = `
-You are Schedy AI, a DETERMINISTIC TRANSACTIONAL AGENT for "${barberData.barberShopName}".
-Your role is to transform Validated State into Natural Language.
+You are Schedy AI for "${barberData.barberShopName}". 
+Goal: Task-oriented booking concierge.
+
+--- SMART INTERPRETATION ---
+- Numbers: "1030" is 10:30, "17" is 17:00. 
+- Relative time: "Morning", "Afternoon" refers to business hours: ${barberData.settings?.businessHours?.open} to ${barberData.settings?.businessHours?.close}.
 
 --- SINGLE SOURCE OF TRUTH (MANDATORY) ---
-CURRENT SYSTEM STATE FOR THIS CLIENT:
-- Appointment Exists: ${validatedBookingState.exists ? "YES" : "NO"}
-- Current State: ${validatedBookingState.state || "NONE"}
-- Details: ${validatedBookingState.exists ? JSON.stringify(validatedBookingState.data) : "N/A"}
+- Current State for Client: ${validatedBookingState.exists ? "HAS_BOOKING" : "NO_BOOKING"}
+- Agenda Status:
+${busySlots || "Agenda is completely empty."}
 
-BUSINESS DATA:
-- Shop Time: ${scheduler.currentTimeLocal} | Date: ${scheduler.hojeLocalISO}
-- Services Available:
+--- CRITICAL REASONING RULES ---
+1. IF USER PICKS AN [OCUPADO] TIME: You MUST explicitly apologize and state that the time was JUST taken. Do not jump to the next time without explaining.
+2. TRUTH OVER HISTORY: Even if you said 10:30 was free 1 minute ago, if it is now [OCUPADO], tell the user it is gone.
+3. Use only these services:
 ${techServices}
-- OCCUPIED SLOTS (DO NOT OFFER):
-${busySlots || "None."}
 
---- ANTI-HALLUCINATION PROTOCOL ---
-1. DO NOT trust conversation history for booking status. Use only "CURRENT SYSTEM STATE" above.
-2. If CURRENT SYSTEM STATE says "Appointment Exists: NO", you MUST NOT claim the user has a booking.
-3. If user asks to cancel but state is NONE, inform they have no active booking.
-4. TRANSITIONS: Only suggest transitions valid for the Current State. (NONE -> CONFIRMED, CONFIRMED -> CANCELLED).
-
---- WORKFLOW ---
-1. Identify Name (Current: ${clientName || "UNKNOWN"}).
-2. Collect Service -> Collect Time -> Summary -> [FINALIZAR_AGENDAMENTO]
-3. If user changes subject, respond briefly and pivot back to the checklist.
-
-Language: ${targetLanguage}.
+Language: ${targetLanguage}. 
 ${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
 `;
 
@@ -205,14 +190,14 @@ ${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
 
         let history = (await chatRef.get()).data()?.history || [];
         const chat = model.startChat({ history: history.slice(-6) }); 
-        const finalInput = isInitialMessage ? `Greeting: Client scanned QR for ${barberData.barberShopName}.` : userMessage;
+        const finalInput = isInitialMessage ? `Greeting: Scanned QR for ${barberData.barberShopName}.` : userMessage;
 
-        // EXECUÇÃO COM RESILIÊNCIA (RETRY)
+        // EXECUÇÃO COM RESILIÊNCIA
         let result = await sendMessageWithRetry(chat, finalInput); 
         let responseText = result.response.text();
         let calls = result.response.functionCalls();
 
-        // 4. CHAIN OF THOUGHT (Execution Layer com Retry)
+        // 4. CHAIN OF THOUGHT (Execution Layer)
         let errorCount = 0;
         while (calls && calls.length > 0) {
             const responses = [];
@@ -223,10 +208,9 @@ ${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
                     responses.push({ functionResponse: { name: call.name, response: { content: toolResult } } });
                 } catch (e) {
                     errorCount++;
-                    responses.push({ functionResponse: { name: call.name, response: { content: "SYSTEM_ERROR" } } });
+                    responses.push({ functionResponse: { name: call.name, response: { content: "SYSTEM_SYNC_ERROR" } } });
                 }
             }
-            // Executa resposta da ferramenta com Retry
             result = await sendMessageWithRetry(chat, responses);
             responseText = result.response.text();
             calls = result.response.functionCalls();
@@ -246,7 +230,6 @@ ${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
 
     } catch (error) {
         console.error("CRITICAL AI ERROR:", error);
-        // Fallback resiliente em caso de falha persistente do Google
         return "Tive um pequeno problema técnico ao consultar minha agenda. Por favor, tente novamente em alguns segundos. 🤖";
     }
 };
