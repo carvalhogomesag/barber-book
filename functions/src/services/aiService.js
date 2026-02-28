@@ -16,7 +16,6 @@ const HUMAN_HANDOFF_KEYWORDS =[
   "speak to person", "agent", "operator", "stupid", "error", "help me"
 ];
 
-// Utilitário de Resiliência
 const sendMessageWithRetry = async (chat, message, retries = 2) => {
     for (let i = 0; i <= retries; i++) {
         try { return await chat.sendMessage(message); } 
@@ -33,7 +32,7 @@ const sendMessageWithRetry = async (chat, message, retries = 2) => {
 exports.processMessageWithAI = async ({ 
     barberId, barberData, clientName, messageBody, fromNumber, 
     isInitialMessage, db, mappingRef, globalAIConfig, targetLanguage,
-    barberTimezone, serverTimeISO, validatedBookingState 
+    barberTimezone
 }) => {
     try {
         const chatRef = db.collection("barbers").doc(barberId).collection("chats").doc(fromNumber);
@@ -42,35 +41,38 @@ exports.processMessageWithAI = async ({
 
         // 1. HITL (Human in the Loop)
         if (HUMAN_HANDOFF_KEYWORDS.some(k => userMessage.toLowerCase().includes(k))) {
-            return "Entendido. Vou pedir para o profissional assumir agora. Só um instante! [PAUSE_AI]";
+            return isVoiceMode 
+              ? "Entendido. Vou transferir para o profissional. [PAUSE_AI]" 
+              : "Entendido. Vou pedir para o profissional assumir agora. Só um instante! [PAUSE_AI]";
         }
 
         const chatDoc = await chatRef.get();
         if (chatDoc.exists && chatDoc.data().status === 'paused') return null;
 
-        // 2. GROUNDING (Coleta de Dados)
+        // 2. GROUNDING (Coleta de Dados e INJEÇÃO DE ESTADO REAL)
         const servicesSnap = await db.collection("barbers").doc(barberId).collection("services").get();
         const techServices = servicesSnap.docs.map(doc => `- SERVICE: "${doc.data().name}" | PRICE: ${doc.data().price} | DURATION: ${doc.data().duration} min`).join('\n');
 
-        const activeStatusList = ["CONFIRMED", "scheduled", "PENDING"];
-        const appointmentsSnap = await db.collection("barbers").doc(barberId).collection("appointments")
-            .where("startTime", ">=", new Date().toISOString().split('T')[0])
-            .where("status", "in", activeStatusList).get();
+        // BUSCA O STATUS REAL DO CLIENTE (Cura da Amnésia)
+        const userAptsSnap = await db.collection("barbers").doc(barberId).collection("appointments")
+            .where("clientPhone", "==", fromNumber)
+            .where("status", "in",["CONFIRMED", "scheduled", "PENDING"]).get();
         
-        let busySlotsList = appointmentsSnap.docs.map(doc => `[OCUPADO] ${doc.data().startTime}`);
-        const breakTime = barberData.settings?.businessHours?.break; 
-        if (breakTime && breakTime !== "None") {
-            busySlotsList.push(`[OCUPADO/PAUSA] Todos os dias entre ${breakTime.replace('-', ' e ')}`);
-        }
+        const userCurrentAppointments = userAptsSnap.docs.map(doc => ({
+            id: doc.id,
+            service: doc.data().serviceName,
+            time: doc.data().startTime,
+            status: doc.data().status
+        }));
 
         const timezone = barberTimezone || barberData.timezone || "America/New_York";
         const scheduler = getSchedulerContext(timezone);
         const tools = setupTools(db, barberId, timezone, mappingRef, fromNumber);
 
-        // 3. CONSTRUÇÃO DO PROMPT (Via Módulo Externo)
+        // 3. CONSTRUÇÃO DO PROMPT
         const finalPrompt = buildMasterPrompt({
             barberData, clientName, scheduler, techServices, 
-            busySlotsString: busySlotsList.join('\n'), 
+            userCurrentAppointments, // INJEÇÃO DA VERDADE
             targetLanguage, isVoiceMode, globalAIConfig
         });
 
@@ -81,11 +83,12 @@ exports.processMessageWithAI = async ({
             tools:[{ functionDeclarations: toolsDeclaration }] 
         });
 
+        // HISTÓRICO APENAS TEXTUAL (A Injeção de estado acima resolve a falta de metadados das funções)
         let history = (await chatRef.get()).data()?.history ||[];
         const chat = model.startChat({ history: history.slice(-6) }); 
         const finalInput = isInitialMessage ? `Greeting: Scanned QR for ${barberData.barberShopName}.` : userMessage;
 
-        // 5. EXECUÇÃO DO LOOP DE PENSAMENTO
+        // 5. EXECUÇÃO DO LOOP DE PENSAMENTO E FUNCTION CALLS
         let result = await sendMessageWithRetry(chat, finalInput); 
         let responseText = result.response.text();
         let calls = result.response.functionCalls();
@@ -109,7 +112,11 @@ exports.processMessageWithAI = async ({
         if (isVoiceMode) responseText = responseText.replace(/\*/g, '').replace(/#/g, '').trim();
 
         await chatRef.set({ 
-            history: [...history, { role: "user", parts:[{ text: userMessage }] }, { role: "model", parts: [{ text: responseText }] }].slice(-20),
+            history:[
+              ...history, 
+              { role: "user", parts: [{ text: userMessage }] }, 
+              { role: "model", parts: [{ text: responseText }] }
+            ].slice(-10),
             lastMessage: userMessage, 
             updatedAt: new Date().toISOString()
         }, { merge: true });
@@ -118,6 +125,6 @@ exports.processMessageWithAI = async ({
 
     } catch (error) {
         console.error("CRITICAL AI ERROR:", error);
-        return "Estou com dificuldade em sincronizar a agenda agora. Pode repetir o seu pedido? 🤖";
+        return "Estou com dificuldade em acessar a agenda agora. Pode repetir o seu pedido? 🤖";
     }
 };
