@@ -24,7 +24,6 @@ const isOverlapping = (startA, durationA, startB, durationB) => {
 
 /**
  * FÁBRICA DE FERRAMENTAS (Tools Factory)
- * MANTIDO: Lógica transacional determinística.
  */
 const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
   return {
@@ -32,7 +31,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
       await mappingRef.update({ clientName: args.name });
       const customerRef = db.collection("barbers").doc(barberId).collection("customers").doc(fromNumber);
       await customerRef.set({ name: args.name, phone: fromNumber, updatedAt: new Date().toISOString() }, { merge: true });
-      return `SUCCESS: Client name saved as ${args.name}.`;
+      return `SUCCESS: Identity saved as ${args.name}.`;
     },
 
     update_customer_data: async (args) => {
@@ -42,9 +41,18 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
     },
     
     get_realtime_agenda: async () => {
-      const snap = await db.collection("barbers").doc(barberId).collection("appointments").get();
+      // BUSCA TODOS OS STATUS ATIVOS (Dashboard + IA)
+      const snap = await db.collection("barbers").doc(barberId).collection("appointments")
+        .where("status", "in", ["CONFIRMED", "scheduled", "PENDING"])
+        .get();
+        
       if (snap.empty) return "VERDICT: Database is EMPTY.";
-      const appointments = snap.docs.map(doc => ({ client: doc.data().clientName, service: doc.data().serviceName, time: doc.data().startTime, duration: doc.data().duration }));
+      const appointments = snap.docs.map(doc => ({ 
+        client: doc.data().clientName, 
+        service: doc.data().serviceName, 
+        time: doc.data().startTime, 
+        duration: doc.data().duration 
+      }));
       return `VERDICT: Current actual bookings: ${JSON.stringify(appointments)}`;
     },
 
@@ -61,6 +69,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
           let conflictFound = false;
           snapshot.forEach(doc => {
             const existing = doc.data();
+            // Verifica conflito contra qualquer agendamento não-cancelado
             if (existing.status !== 'CANCELLED' && isOverlapping(requestedStart, requestedDuration, existing.startTime, existing.duration)) {
               conflictFound = true;
             }
@@ -68,7 +77,8 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
           if (conflictFound) return "ERROR: SLOT_OCCUPIED.";
           
           const newDocRef = appointmentsRef.doc();
-          transaction.set(newDocRef, { ...args, source: 'ai_enterprise', createdAt: new Date().toISOString(), status: 'CONFIRMED' });
+          // Gravamos como 'scheduled' para compatibilidade total com o Dashboard visual
+          transaction.set(newDocRef, { ...args, source: 'ai_enterprise', createdAt: new Date().toISOString(), status: 'scheduled' });
           return "SUCCESS: APPOINTMENT_CREATED";
         });
       } catch (e) { return "ERROR: SYNC_FAIL"; }
@@ -79,7 +89,11 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
       const ref = db.collection("barbers").doc(barberId).collection("appointments");
       try {
         return await db.runTransaction(async (transaction) => {
-          const userDocs = await transaction.get(ref.where("clientPhone", "==", fromNumber).where("status", "==", "CONFIRMED"));
+          // Busca agendamentos ativos para este cliente
+          const userDocs = await transaction.get(
+            ref.where("clientPhone", "==", fromNumber)
+               .where("status", "in", ["CONFIRMED", "scheduled"])
+          );
           if (userDocs.empty) return "ERROR: NOT_FOUND";
           const targetDoc = userDocs.docs[0];
           transaction.update(targetDoc.ref, { startTime: requestedStart, updatedAt: new Date().toISOString() });
@@ -90,7 +104,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
 
     delete_appointment: async (args) => {
       const ref = db.collection("barbers").doc(barberId).collection("appointments");
-      const snapshot = await ref.where("clientPhone", "==", fromNumber).where("status", "==", "CONFIRMED").limit(1).get();
+      const snapshot = await ref.where("clientPhone", "==", fromNumber).where("status", "in", ["CONFIRMED", "scheduled"]).limit(1).get();
       if (snapshot.empty) return "ERROR: NOT_FOUND";
       await snapshot.docs[0].ref.update({ status: "CANCELLED", updatedAt: new Date().toISOString() });
       return "SUCCESS: CANCELLED";
@@ -127,7 +141,7 @@ const sendMessageWithRetry = async (chat, message, retries = 2) => {
 };
 
 /**
- * LÓGICA PRINCIPAL (REFINADA COM RACIOCÍNIO DE CONFLITO)
+ * LÓGICA PRINCIPAL (REFINADA: HARMONIZAÇÃO DASHBOARD + IA)
  */
 exports.processMessageWithAI = async ({ 
     barberId, barberData, clientName, messageBody, fromNumber, 
@@ -145,40 +159,61 @@ exports.processMessageWithAI = async ({
             return "Entendido. Vou pedir para o profissional assumir agora. Só um instante! [PAUSE_AI]";
         }
 
+        const chatDoc = await chatRef.get();
+        if (chatDoc.exists && chatDoc.data().status === 'paused') return null;
+
         // --- 2. GROUNDING (FONTE ÚNICA DE VERDADE) ---
         const servicesSnap = await db.collection("barbers").doc(barberId).collection("services").get();
         const techServices = servicesSnap.docs.map(doc => `- SERVICE: "${doc.data().name}" | PRICE: ${doc.data().price} | DURATION: ${doc.data().duration}`).join('\n');
 
+        // BUSCA TODOS OS AGENDAMENTOS ATIVOS (Incluindo os do Dashboard 'scheduled')
+        const activeStatusList = ["CONFIRMED", "scheduled", "PENDING"];
         const appointmentsSnap = await db.collection("barbers").doc(barberId).collection("appointments")
             .where("startTime", ">=", new Date().toISOString().split('T')[0])
-            .where("status", "==", "CONFIRMED").get();
-        const busySlots = appointmentsSnap.docs.map(doc => `[OCUPADO] ${doc.data().startTime}`).join('\n');
+            .where("status", "in", activeStatusList).get();
+        
+        let busySlotsList = appointmentsSnap.docs.map(doc => `[OCUPADO] ${doc.data().startTime}`);
+
+        // --- INJEÇÃO DO BREAK TIME COMO SLOT OCUPADO ---
+        const breakTime = barberData.settings?.businessHours?.break; 
+        if (breakTime && breakTime !== "None") {
+            busySlotsList.push(`[OCUPADO/BREAK] Todos os dias entre ${breakTime.replace('-', ' e ')} (Pausa para almoço/descanso)`);
+        }
+        const busySlotsString = busySlotsList.join('\n');
 
         const timezone = barberTimezone || barberData.timezone || "America/New_York";
         const scheduler = getSchedulerContext(timezone);
         const tools = setupTools(db, barberId, timezone, mappingRef, fromNumber);
 
-        // --- 3. MASTER PROMPT (REGRAS DE INTEGRIDADE E SMART INTERPRETATION) ---
+        // --- 3. MASTER PROMPT TRANSACIONAL ---
         const MASTER_PROMPT = `
-You are Schedy AI for "${barberData.barberShopName}". 
-Goal: Task-oriented booking concierge.
-
---- SMART INTERPRETATION ---
-- Numbers: "1030" is 10:30, "17" is 17:00. 
-- Relative time: "Morning", "Afternoon" refers to business hours: ${barberData.settings?.businessHours?.open} to ${barberData.settings?.businessHours?.close}.
+You are Schedy AI, a DETERMINISTIC TRANSACTIONAL AGENT for "${barberData.barberShopName}".
+Your role: Transform Validated State into Natural Language.
 
 --- SINGLE SOURCE OF TRUTH (MANDATORY) ---
-- Current State for Client: ${validatedBookingState.exists ? "HAS_BOOKING" : "NO_BOOKING"}
-- Agenda Status:
-${busySlots || "Agenda is completely empty."}
+CURRENT SYSTEM STATE FOR THIS CLIENT:
+- Appointment Exists in DB: ${validatedBookingState.exists ? "YES" : "NO"}
+- Current State: ${validatedBookingState.state || "NONE"}
+- Details: ${validatedBookingState.exists ? JSON.stringify(validatedBookingState.data) : "N/A"}
 
---- CRITICAL REASONING RULES ---
-1. IF USER PICKS AN [OCUPADO] TIME: You MUST explicitly apologize and state that the time was JUST taken. Do not jump to the next time without explaining.
-2. TRUTH OVER HISTORY: Even if you said 10:30 was free 1 minute ago, if it is now [OCUPADO], tell the user it is gone.
-3. Use only these services:
-${techServices}
+BUSINESS DATA:
+- Shop Time: ${scheduler.currentTimeLocal} | Date: ${scheduler.hojeLocalISO}
+- Open Hours: ${barberData.settings?.businessHours?.open} to ${barberData.settings?.businessHours?.close}
+- BREAK TIME: ${breakTime || "None"}
+- OCCUPIED SLOTS (DO NOT OFFER):
+${busySlotsString || "None."}
 
-Language: ${targetLanguage}. 
+--- ANTI-HALLUCINATION RULES ---
+1. TRUTH OVER HISTORY: Even if you said a slot was free, if it is now [OCUPADO] or [BREAK], you MUST explicitly apologize and say it was just taken.
+2. DO NOT trust conversation history for booking status. Use only "CURRENT SYSTEM STATE" above.
+3. TRANSITIONS: NONE -> CONFIRMED, CONFIRMED -> CANCELLED.
+4. INTELLIGENCE: "1030" is 10:30, "17" is 17:00.
+
+--- WORKFLOW ---
+1. Identify Name (Current: ${clientName || "UNKNOWN"}).
+2. Collect Service -> Collect Time -> Summary -> [FINALIZAR_AGENDAMENTO]
+
+Language: ${targetLanguage}.
 ${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
 `;
 
@@ -208,7 +243,7 @@ ${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
                     responses.push({ functionResponse: { name: call.name, response: { content: toolResult } } });
                 } catch (e) {
                     errorCount++;
-                    responses.push({ functionResponse: { name: call.name, response: { content: "SYSTEM_SYNC_ERROR" } } });
+                    responses.push({ functionResponse: { name: call.name, response: { content: "SYSTEM_ERROR" } } });
                 }
             }
             result = await sendMessageWithRetry(chat, responses);
@@ -229,7 +264,7 @@ ${isVoiceMode ? "- VOICE MODE: Very short phrases, no formatting." : ""}
         return responseText;
 
     } catch (error) {
-        console.error("CRITICAL AI ERROR:", error);
-        return "Tive um pequeno problema técnico ao consultar minha agenda. Por favor, tente novamente em alguns segundos. 🤖";
+        console.error("LLM ISOLATION ERROR:", error);
+        return "Estou com dificuldade em sincronizar a agenda. Vou pedir para o barbeiro confirmar manualmente. [PAUSE_AI]";
     }
 };

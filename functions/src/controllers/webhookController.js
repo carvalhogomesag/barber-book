@@ -107,12 +107,10 @@ async function identifyTenant(messageBody, fromNumber, db) {
   if (tenantIds.length === 0) return { needsLink: true };
 
   const lastId = activeMapping.lastActiveBarberId;
+  if (!lastId) return { needsLink: true };
+
   const barberDoc = await db.collection("barbers").doc(lastId).get();
   
-  if (tenantIds.length > 1 && !lastId) {
-     return { needsChoice: true, tenantList: tenantIds.map(id => ({ id, name: activeMapping.tenants[id].name })) };
-  }
-
   return { barberId: lastId, clientName: activeMapping.clientName, mappingRef, barberData: barberDoc.data() };
 }
 
@@ -126,6 +124,7 @@ exports.handleIncomingMessage = async (req, res) => {
   const messageBody = req.body.Body || "";
   const isCall = req.body.CallSid || (!req.body.Body && req.body.From);
 
+  // Contexto para logs e Circuit Breaker
   let currentContext = { barberId: null, clientPhone: fromNumber, flow: isCall ? "VOICE" : "TEXT" };
 
   try {
@@ -137,26 +136,22 @@ exports.handleIncomingMessage = async (req, res) => {
       return res.status(200).type("text/xml").send(twiml.toString());
     }
 
-    if (result.needsChoice) {
-      const menu = result.tenantList.map((t, i) => `${i + 1}) ${t.name}`).join("\n");
-      twiml.message(`Olá! Com quem deseja falar hoje?\n\n${menu}`);
-      return res.status(200).type("text/xml").send(twiml.toString());
-    }
-
-    // --- 1. INVARIANTE: READ-BEFORE-RESPOND (Princípio 2.2) ---
-    // ATUALIZAÇÃO CRÍTICA: Passamos 'result.clientName' para habilitar a busca em cascata (Telefone -> Nome)
+    // --- 1. INVARIANTE: READ-BEFORE-RESPOND ---
     const validatedState = await bookingService.checkBookingStatus(result.barberId, fromNumber, result.clientName);
 
-    // --- 2. CONVERSATION GOVERNOR (Princípio 7) ---
+    // --- 2. CONVERSATION GOVERNOR (Avalia o novo limite de 10 interações) ---
     const mappingDoc = await result.mappingRef.get();
     const mappingData = mappingDoc.data();
     const interactionCount = mappingData?.tenants?.[result.barberId]?.interactionCount || 0;
     const isPaused = mappingData?.tenants?.[result.barberId]?.status === 'paused';
 
+    // Bloqueia resposta da IA se o status for pausado (HITL)
     if (isPaused && !isCall) {
+        console.log(`[HITL] Silenciando IA para ${fromNumber} (Status: Pausado)`);
         return res.status(200).send("AI_PAUSED_SILENT");
     }
 
+    // O Governor decide se deve escalar baseado no limite de interações
     const governorResult = await conversationGovernor.evaluateEscalation(
       result.barberId, fromNumber, interactionCount, validatedState.state
     );
@@ -179,10 +174,10 @@ exports.handleIncomingMessage = async (req, res) => {
             to: fromNumber.replace('whatsapp:', ''), 
             from: CONCIERGE_NUMBER
        });
-       return res.status(200).send("Voice handoff completed.");
+       return res.status(200).send("Voice callback initiated.");
     }
 
-    // --- 4. LLM ISOLATION (Princípio 2.3) ---
+    // --- 4. LLM ISOLATION ---
     const aiConfigSnap = await db.collection("settings").doc("ai_config").get();
     let responseText = await processMessageWithAI({
       barberId: result.barberId,
@@ -200,7 +195,7 @@ exports.handleIncomingMessage = async (req, res) => {
       validatedBookingState: validatedState 
     });
 
-    // --- 5. PERSISTÊNCIA DE ESTADO E GOVERNOR ---
+    // --- 5. ATUALIZAÇÃO DO GOVERNOR (Incremento do contador) ---
     await result.mappingRef.set({
       tenants: {
         [result.barberId]: { 
@@ -211,6 +206,7 @@ exports.handleIncomingMessage = async (req, res) => {
     }, { merge: true });
 
     // --- 6. TRANSACTIONAL TAG PARSER ---
+    // Escalonamento Humano via Tag Manual da IA
     if (responseText.includes("[PAUSE_AI]")) {
       await result.mappingRef.set({ tenants: { [result.barberId]: { status: 'paused' } } }, { merge: true });
       const chatRef = db.collection("barbers").doc(result.barberId).collection("chats").doc(fromNumber);
@@ -218,6 +214,7 @@ exports.handleIncomingMessage = async (req, res) => {
       responseText = responseText.replace("[PAUSE_AI]", "").trim();
     }
 
+    // Gravação automática via Tag de Finalização
     const tagMatch = responseText.match(/\[FINALIZAR_AGENDAMENTO:\s*({.*?})\]/s);
     if (tagMatch) {
       try {
@@ -225,6 +222,7 @@ exports.handleIncomingMessage = async (req, res) => {
         const success = await executeAutoBooking(db, result.barberId, fromNumber, bookingData, result.clientName);
         if (success) {
           responseText = responseText.replace(/\[FINALIZAR_AGENDAMENTO:.*?\]/gs, "").trim();
+          // Reset interaction count ao finalizar transação com sucesso
           await result.mappingRef.set({ tenants: { [result.barberId]: { interactionCount: 0 } } }, { merge: true });
         }
       } catch (e) { console.error("[TAG_PARSER_ERROR]", e); }
@@ -234,9 +232,10 @@ exports.handleIncomingMessage = async (req, res) => {
     res.status(200).type("text/xml").send(twiml.toString());
 
   } catch (error) {
+    // --- 7. CIRCUIT BREAKER ---
     await circuitBreaker.trigger(error, currentContext);
     const fallbackMsg = "Estou com dificuldade para acessar a agenda agora. Vou solicitar que o profissional te responda manualmente em instantes! 🤖";
     twiml.message(fallbackMsg);
     res.status(200).type("text/xml").send(twiml.toString());
   }
-};  
+};

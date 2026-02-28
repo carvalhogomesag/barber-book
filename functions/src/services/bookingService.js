@@ -2,10 +2,12 @@ const admin = require("firebase-admin");
 
 /**
  * MÁQUINA DE ESTADOS FORMAL (Enterprise Spec)
+ * Harmonizada para aceitar o status do Dashboard ('scheduled') e o Enterprise ('CONFIRMED')
  */
 const BOOKING_STATES = {
   PENDING: 'PENDING',
   CONFIRMED: 'CONFIRMED',
+  SCHEDULED: 'scheduled', // Status nativo do Dashboard Visual
   CANCELLED: 'CANCELLED',
   COMPLETED: 'COMPLETED'
 };
@@ -14,8 +16,9 @@ const BOOKING_STATES = {
  * REGRAS DE TRANSIÇÃO DE ESTADO (Princípio 3)
  */
 const VALID_TRANSITIONS = {
-  [BOOKING_STATES.PENDING]: [BOOKING_STATES.CONFIRMED, BOOKING_STATES.CANCELLED],
+  [BOOKING_STATES.PENDING]: [BOOKING_STATES.CONFIRMED, BOOKING_STATES.SCHEDULED, BOOKING_STATES.CANCELLED],
   [BOOKING_STATES.CONFIRMED]: [BOOKING_STATES.CANCELLED, BOOKING_STATES.COMPLETED],
+  [BOOKING_STATES.SCHEDULED]: [BOOKING_STATES.CANCELLED, BOOKING_STATES.COMPLETED],
   [BOOKING_STATES.CANCELLED]: [], 
   [BOOKING_STATES.COMPLETED]: []  
 };
@@ -27,7 +30,7 @@ const bookingService = {
   
   /**
    * INVARIANTE: Consulta Firestore antes de qualquer resposta da IA.
-   * Lógica de busca híbrida (Telefone -> Nome) para evitar o erro do "Allan".
+   * Lógica de busca híbrida (Telefone -> Nome) e Harmonização de Status.
    */
   async checkBookingStatus(barberId, clientPhone, clientName = null) {
     if (!barberId || !clientPhone) {
@@ -38,27 +41,32 @@ const bookingService = {
       const db = admin.firestore();
       const appointmentsRef = db.collection("barbers").doc(barberId).collection("appointments");
       
-      // 1. TENTATIVA A: Busca por Telefone (Prioridade Máxima)
-      // Filtramos apenas os que NÃO estão cancelados para não confundir a IA
+      // Lista de status que o sistema considera como "Agendamento Ativo"
+      const activeStatusList = [
+        BOOKING_STATES.CONFIRMED, 
+        BOOKING_STATES.SCHEDULED, 
+        BOOKING_STATES.PENDING
+      ];
+
+      // 1. TENTATIVA A: Busca por Telefone (Prioridade)
       let snapshot = await appointmentsRef
         .where("clientPhone", "==", clientPhone)
-        .where("status", "in", [BOOKING_STATES.CONFIRMED, BOOKING_STATES.PENDING])
+        .where("status", "in", activeStatusList)
         .orderBy("startTime", "desc")
         .limit(1)
         .get();
 
-      // 2. TENTATIVA B: Fallback por Nome (Resolve o caso de agendamentos manuais)
+      // 2. TENTATIVA B: Fallback por Nome (Garante que agendamentos manuais sejam vistos)
       if (snapshot.empty && clientName && clientName !== "UNKNOWN") {
-        console.log(`[BookingService] Telefone não achou nada. Tentando Nome: ${clientName}`);
+        console.log(`[BookingService] Buscando por Nome: ${clientName}`);
         snapshot = await appointmentsRef
           .where("clientName", "==", clientName)
-          .where("status", "in", [BOOKING_STATES.CONFIRMED, BOOKING_STATES.PENDING])
+          .where("status", "in", activeStatusList)
           .orderBy("startTime", "desc")
           .limit(1)
           .get();
       }
 
-      // Se ambas as buscas falharem
       if (snapshot.empty) {
         return { exists: false, state: null, data: null };
       }
@@ -80,18 +88,17 @@ const bookingService = {
       };
     } catch (error) {
       console.error("[CRITICAL] BookingService Database Error:", error);
-      throw error; // Lança para o Circuit Breaker no controller
+      throw error; 
     }
   },
 
   /**
-   * VALIDAÇÃO DE MÁQUINA DE ESTADOS
-   * Impede transições proibidas (ex: Reativar algo já cancelado)
+   * VALIDAÇÃO DE TRANSIÇÃO
    */
   validateTransition(currentState, nextState) {
     const allowed = VALID_TRANSITIONS[currentState] || [];
     if (!allowed.includes(nextState)) {
-      console.error(`[TRANSITION_ERROR] ${currentState} -> ${nextState} is forbidden.`);
+      console.error(`[TRANSITION_ERROR] Transition ${currentState} -> ${nextState} is blocked by business rules.`);
       return false;
     }
     return true;

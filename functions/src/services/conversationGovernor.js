@@ -5,25 +5,27 @@ const admin = require("firebase-admin");
  * Monitora a saúde da conversa e impede loops infinitos.
  */
 const conversationGovernor = {
-  // Limite máximo de interações antes do escalonamento obrigatório
-  MAX_INTERACTIONS: 6,
+  // Aumentado de 6 para 10 conforme solicitação de teste de estresse
+  MAX_INTERACTIONS: 10,
 
   /**
    * Avalia se a conversa deve ser transferida para um humano.
-   * Regra: Se count > limite E estado não for final (CONFIRMED/CANCELLED)
+   * Regra: Se count >= limite E estado não for final (CONFIRMED/CANCELLED)
    */
   async evaluateEscalation(barberId, clientPhone, interactionCount, currentBookingState) {
     const db = admin.firestore();
     const timestamp = new Date().toISOString();
 
-    // Verificamos se o estado atual é um estado "Resolvido"
+    // Verificamos se o estado atual é um estado "Resolvido" (Finalizado)
     const isResolved = currentBookingState === 'CONFIRMED' || currentBookingState === 'CANCELLED';
+    
+    // O gatilho dispara quando o contador atinge ou ultrapassa o limite
     const isLimitExceeded = interactionCount >= this.MAX_INTERACTIONS;
 
     if (isLimitExceeded && !isResolved) {
-      console.warn(`[GOVERNOR] Escalonamento ativado para ${clientPhone}. Limite de ${this.MAX_INTERACTIONS} mensagens atingido.`);
+      console.warn(`[GOVERNOR] Escalonamento ativado para ${clientPhone}. Limite de ${this.MAX_INTERACTIONS} interações atingido.`);
 
-      // 1. Criar registro global em notifications/ (Conforme item 7 da Spec)
+      // 1. Criar registro global em notifications/ para auditoria administrativa
       await db.collection("notifications").add({
         type: "human_intervention_required",
         reason: "MAX_INTERACTIONS_EXCEEDED",
@@ -31,6 +33,7 @@ const conversationGovernor = {
         clientPhone,
         lastBookingState: currentBookingState || "NONE",
         interactionCount,
+        limitSet: this.MAX_INTERACTIONS,
         createdAt: timestamp
       });
 
@@ -39,18 +42,18 @@ const conversationGovernor = {
         type: "ATTENTION_REQUIRED",
         reason: "IA_STUCK",
         clientPhone,
-        description: "A IA atingiu o limite de tentativas sem finalizar o agendamento.",
+        description: `A IA atingiu o limite de ${this.MAX_INTERACTIONS} interações sem finalizar o agendamento. Transbordo manual ativado.`,
         createdAt: timestamp,
         resolved: false
       });
 
-      // 3. Pausar a IA no mapeamento do cliente (Impedir respostas futuras)
+      // 3. Pausar a IA no mapeamento do cliente para silenciar o bot
       const mappingRef = db.collection("customer_mappings").doc(clientPhone);
       await mappingRef.set({
         tenants: {
           [barberId]: {
             status: 'paused',
-            pausedReason: 'governor_limit',
+            pausedReason: 'governor_limit_exceeded',
             lastInteraction: timestamp
           }
         }
