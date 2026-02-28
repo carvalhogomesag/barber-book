@@ -1,81 +1,52 @@
 import React from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { 
-  Calendar, 
-  LogOut, 
-  User, 
-  Zap, 
-  ShieldAlert, 
-  FileText, 
-  Briefcase, 
-  Users,
-  MessageSquare,
-  Sparkles,
-  BarChart3,
-  CreditCard,
-  TrendingUp,
-  HelpCircle,
-  X,
-  ShieldCheck,
-  Clock,
-  LayoutDashboard,
-  Settings,
-  Bell,    // Ícone para Notificações
-  QrCode   // Ícone para Compartilhar/QR
+  Calendar, LogOut, User, Zap, ShieldAlert, FileText, 
+  Briefcase, Users, MessageSquare, Sparkles, BarChart3, 
+  CreditCard, TrendingUp, HelpCircle, X, Bell, QrCode,
+  ChevronRight, ChevronLeft, Menu
 } from 'lucide-react';
 import { signOut } from 'firebase/auth';
 import { auth } from '../../services/firebase';
 import { useAuth } from '../../contexts/AuthContext'; 
 import { PWAInstallButton } from './PWAInstallButton';
 
-export function Sidebar({ onClose }) {
+export function Sidebar({ isCollapsed, toggleCollapse, onCloseMobile }) {
   const location = useLocation(); 
   const navigate = useNavigate();
   const { profile } = useAuth(); 
 
-  // DEFINIÇÃO DE PERMISSÕES
   const isAdmin = profile?.role === 'admin';
   const isPro = profile?.plan === 'pro';
   const isSales = profile?.role === 'sales';
 
-  // --- CONSTRUÇÃO DINÂMICA DO MENU ---
   let menuItems = [];
 
   if (isAdmin) {
-    // MENU ADMIN (DONO DO SAAS)
     menuItems = [
       { path: '/admin', icon: ShieldAlert, label: 'Management' },      
-      { path: '/admin-dashboard', icon: BarChart3, label: 'BI Analytics' },
-      { path: '/profile', icon: User, label: 'My Admin Profile' },
-      { path: '/support', icon: HelpCircle, label: 'Help Center' },
-      { path: '/terms', icon: FileText, label: 'Legal' },
+      { path: '/admin-dashboard', icon: BarChart3, label: 'Analytics' },
+      { path: '/profile', icon: User, label: 'Settings' },
     ];
   } else if (isSales) {
-    // MENU COMERCIAL (VENDEDOR)
-    // O QR Code do vendedor já fica dentro do "Sales Console"
     menuItems = [
-      { path: '/sales-console', icon: TrendingUp, label: 'Sales Console' },
-      { path: '/sales-crm', icon: Users, label: 'My Network' },
-      { path: '/sales-analytics', icon: BarChart3, label: 'Performance' },
-      { path: '/profile', icon: User, label: 'My Profile' },
-      { path: '/support', icon: HelpCircle, label: 'Help Center' },
-      { path: '/terms', icon: FileText, label: 'Legal' },
+      { path: '/sales-console', icon: TrendingUp, label: 'Dashboard' },
+      { path: '/sales-crm', icon: Users, label: 'Network' },
+      { path: '/sales-analytics', icon: BarChart3, label: 'Reports' },
+      { path: '/profile', icon: User, label: 'Profile' },
     ];
   } else {
-    // MENU PROFISSIONAL (BARBEIRO)
     menuItems = [
       { path: '/dashboard', icon: Calendar, label: 'Schedule' },
-      { path: '/notifications', icon: Bell, label: 'Inbox & Alerts' }, // Nova: Notificações da IA
+      { path: '/notifications', icon: Bell, label: 'Inbox' },
       { path: '/messages', icon: MessageSquare, label: 'Live Chat' },
       { path: '/customers', icon: Users, label: 'Customers' },
       { path: '/services', icon: Briefcase, label: 'Services' },
-      { path: '/setup-pro', icon: QrCode, label: 'My Link & QR' }, // Nova: Local para baixar o QR Code
+      { path: '/setup-pro', icon: QrCode, label: 'My QR' },
       { path: '/profile', icon: User, label: 'Profile' },
       isPro 
         ? { path: '/billing', icon: CreditCard, label: 'Billing' }
         : { path: '/pricing', icon: Zap, label: 'Plans' },
-      { path: '/support', icon: HelpCircle, label: 'Help Center' },
-      { path: '/terms', icon: FileText, label: 'Legal' },
     ];
   }
 
@@ -85,85 +56,100 @@ export function Sidebar({ onClose }) {
   };
 
   return (
-    <aside className="w-64 bg-barber-black border-r border-zinc-800 flex flex-col h-full shadow-2xl">
+    <div className="flex flex-col h-full bg-white relative">
       
-      {/* HEADER DA SIDEBAR DINÂMICO */}
-      <div className="h-20 flex items-center justify-between px-6 border-b border-zinc-800">
-        <div className="flex items-center gap-2">
-            <Sparkles className={isAdmin ? "text-barber-red" : "text-barber-gold"} size={20} />
-            <h1 className="text-xl font-black text-barber-white tracking-tighter uppercase italic">
-              {isAdmin ? 'SCHEDY ADMIN' : isSales ? 'SCHEDY PARTNER' : 'SCHEDY'}
-            </h1>
+      {/* Botão para Expandir/Retrair (Apenas Desktop) */}
+      <button 
+        onClick={toggleCollapse}
+        className="hidden lg:flex absolute -right-3 top-10 w-6 h-6 bg-schedy-black text-white rounded-full items-center justify-center shadow-vivid z-50 hover:scale-110 transition-transform"
+      >
+        {isCollapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
+      </button>
+
+      {/* HEADER: LOGO */}
+      <div className={`h-16 flex items-center ${isCollapsed ? 'justify-center' : 'px-6'} border-b border-schedy-border shrink-0`}>
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 bg-schedy-black text-white rounded-lg flex items-center justify-center font-black italic text-xs shrink-0">
+            S
+          </div>
+          {!isCollapsed && (
+            <span className="font-black text-xl tracking-tighter text-schedy-black animate-in fade-in slide-in-from-left-2">
+              SCHEDY
+            </span>
+          )}
         </div>
-        
-        <button 
-          onClick={onClose} 
-          className="lg:hidden p-2 text-zinc-500 hover:text-white transition-colors"
-        >
-          <X size={24} />
-        </button>
       </div>
 
-      {/* NAVEGAÇÃO PRINCIPAL */}
-      <nav className="flex-1 py-6 flex flex-col gap-2 px-3 overflow-y-auto custom-scrollbar">
+      {/* NAVEGAÇÃO */}
+      <nav className="flex-1 py-6 flex flex-col gap-1 px-3 overflow-y-auto custom-scrollbar">
         {menuItems.map((item) => {
           const isActive = location.pathname === item.path;
           return (
             <Link
               key={item.path}
               to={item.path}
-              onClick={onClose}
-              className={`flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 ${
-                isActive 
-                  ? 'bg-barber-red text-white shadow-lg shadow-red-900/30 translate-x-1' 
-                  : 'text-barber-gray hover:bg-zinc-800/50 hover:text-white font-medium'
-              }`}
+              onClick={onCloseMobile}
+              title={isCollapsed ? item.label : ''}
+              className={`
+                flex items-center gap-3 px-3 py-3 rounded-xl transition-all duration-200 group
+                ${isActive 
+                  ? 'bg-schedy-black text-white shadow-vivid' 
+                  : 'text-schedy-gray hover:bg-schedy-canvas hover:text-schedy-black'
+                }
+                ${isCollapsed ? 'justify-center' : 'justify-start'}
+              `}
             >
-              <item.icon size={20} />
-              <span className="font-bold uppercase tracking-tight italic text-sm">{item.label}</span>
+              <item.icon size={20} className={isActive ? 'text-white' : 'group-hover:scale-110 transition-transform'} />
+              {!isCollapsed && (
+                <span className="font-bold uppercase tracking-tight text-[11px] whitespace-nowrap animate-in fade-in slide-in-from-left-2">
+                  {item.label}
+                </span>
+              )}
             </Link>
           );
         })}
       </nav>
 
-      {/* ÁREA INFERIOR: IDENTIFICAÇÃO DO USUÁRIO */}
-      <div className="p-4 border-t border-zinc-800 flex flex-col gap-4">
+      {/* FOOTER: PROFILE & LOGOUT */}
+      <div className="p-3 border-t border-schedy-border flex flex-col gap-2">
         
-        <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 shadow-inner">
-          <div className="flex items-center gap-3">
-            <div className={`w-10 h-10 rounded-full flex items-center justify-center text-black font-black italic shadow-lg shrink-0 ${isAdmin ? 'bg-barber-red' : 'bg-barber-gold'}`}>
-              {profile?.name?.charAt(0).toUpperCase() || 'U'}
-            </div>
-            <div className="min-w-0">
-              <p className="text-[11px] font-black text-white uppercase truncate italic leading-tight">
+        {/* Profile Card */}
+        <div className={`
+          flex items-center gap-3 rounded-2xl transition-all
+          ${isCollapsed ? 'justify-center p-1' : 'bg-schedy-canvas p-3'}
+        `}>
+          <div className={`
+            rounded-xl flex items-center justify-center font-black text-white shadow-sm shrink-0
+            ${isAdmin ? 'bg-schedy-danger' : 'bg-schedy-black'}
+            ${isCollapsed ? 'w-10 h-10 text-xs' : 'w-9 h-9 text-[10px]'}
+          `}>
+            {profile?.name?.charAt(0).toUpperCase() || 'U'}
+          </div>
+          
+          {!isCollapsed && (
+            <div className="min-w-0 animate-in fade-in slide-in-from-left-2">
+              <p className="text-[10px] font-black text-schedy-black uppercase truncate leading-tight">
                 {profile?.name || 'User'}
               </p>
-              <p className="text-[9px] text-zinc-500 truncate font-medium">
+              <p className="text-[9px] text-schedy-gray truncate">
                 {profile?.email}
               </p>
             </div>
-          </div>
-
-          <div className="mt-3 flex items-center gap-1.5">
-            <div className={`w-1.5 h-1.5 rounded-full ${
-              isAdmin ? 'bg-barber-red' : profile?.status === 'active' ? 'bg-green-500' : 'bg-barber-gold animate-pulse'
-            }`} />
-            <span className="text-[8px] font-black uppercase tracking-[0.2em] text-zinc-400 italic">
-              {isAdmin ? 'System Owner' : `Account: ${profile?.status === 'active' ? 'Verified' : 'Pending'}`}
-            </span>
-          </div>
+          )}
         </div>
-
-        <PWAInstallButton />
 
         <button 
           onClick={handleLogout}
-          className="w-full flex items-center gap-3 px-4 py-3 text-zinc-500 hover:text-red-500 hover:bg-red-500/10 rounded-xl transition-all font-bold uppercase italic text-sm"
+          title={isCollapsed ? 'Log Out' : ''}
+          className={`
+            flex items-center gap-3 px-3 py-3 text-schedy-gray hover:text-schedy-danger hover:bg-red-50 rounded-xl transition-all font-bold uppercase text-[10px]
+            ${isCollapsed ? 'justify-center' : 'justify-start'}
+          `}
         >
           <LogOut size={20} />
-          <span>Log Out</span>
+          {!isCollapsed && <span className="animate-in fade-in slide-in-from-left-2">Sign Out</span>}
         </button>
       </div>
-    </aside>
+    </div>
   );
 }

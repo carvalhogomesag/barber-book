@@ -1,14 +1,15 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { DndContext, useSensor, useSensors, PointerSensor } from '@dnd-kit/core';
+import React, { useRef } from 'react';
+import { DndContext, useSensor, useSensors, PointerSensor, MouseSensor, TouchSensor } from '@dnd-kit/core';
 import { 
   hoursArray, 
   getNewStartTime, 
   START_HOUR, 
-  getNowPosition, 
-  getPositionFromTime 
+  getPositionFromTime,
+  PIXELS_PER_HOUR
 } from '../../utils/timeGrid'; 
 import { AppointmentCard } from './AppointmentCard';
-import { addDays, format, isSameDay, setHours, setMinutes } from 'date-fns';
+import { addDays, format, isSameDay, setHours, setMinutes, startOfWeek } from 'date-fns';
+import { ChevronLeft, ChevronRight, Calendar as CalendarIcon } from 'lucide-react';
 
 export function DayView({ 
   appointments, 
@@ -17,83 +18,39 @@ export function DayView({
   onTimeSlotClick, 
   onComplete, 
   onDelete,   
-  startDate = new Date(), 
+  startDate = new Date(),
+  onNavigate, // Função para mudar a semana
   businessHours,
-  timezone = "America/New_York"
+  timezone = "Europe/Lisbon"
 }) {
   const scrollContainerRef = useRef(null);
-  const [numDays, setNumDays] = useState(1);
-  const [nowPos, setNowPos] = useState(0);
-  const [currentTimeStr, setCurrentTimeStr] = useState(""); 
-  const [pxPerHour, setPxPerHour] = useState(90);
-  const [containerHeight, setContainerHeight] = useState(0);
+  
+  // SEMPRE exibe 7 dias, começando no Domingo
+  const firstDayOfWeek = startOfWeek(startDate, { weekStartsOn: 0 });
+  const days = Array.from({ length: 7 }, (_, i) => addDays(firstDayOfWeek, i));
 
-  // 1. Ajuste de Responsividade e Escala
-  useEffect(() => {
-    const updateLayout = () => {
-      setNumDays(window.innerWidth >= 768 ? 3 : 1);
-      if (scrollContainerRef.current) {
-        const height = scrollContainerRef.current.offsetHeight;
-        setContainerHeight(height);
-        setPxPerHour(height / 10); 
-      }
-    };
-
-    updateLayout();
-    window.addEventListener('resize', updateLayout);
-    return () => window.removeEventListener('resize', updateLayout);
-  }, []);
-
-  // 2. Lógica da "Agulha Fixa" + Relógio Digital + Auto-Scroll
-  useEffect(() => {
-    const updateNowAndScroll = () => {
-      const now = new Date();
-      
-      const pos = getNowPosition(timezone, pxPerHour);
-      setNowPos(pos);
-
-      const timeStr = new Intl.DateTimeFormat('pt-BR', {
-        timeZone: timezone,
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false
-      }).format(now);
-      setCurrentTimeStr(timeStr);
-      
-      const todayInTimezone = new Date(now.toLocaleString("en-US", {timeZone: timezone}));
-      const isViewingToday = isSameDay(startDate, todayInTimezone);
-      
-      if (isViewingToday && scrollContainerRef.current) {
-        const targetScroll = pos - (containerHeight * 0.3);
-        
-        scrollContainerRef.current.scrollTo({
-          top: targetScroll,
-          behavior: 'smooth'
-        });
-      }
-    };
-
-    updateNowAndScroll();
-    const interval = setInterval(updateNowAndScroll, 10000); 
-    return () => clearInterval(interval);
-  }, [pxPerHour, containerHeight, timezone, startDate]);
-
-  const days = Array.from({ length: numDays }, (_, i) => addDays(startDate, i));
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
+  // Sensores de D&D configurados para precisão
+  const sensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 10 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } })
+  );
 
   const handleDragEnd = (event) => {
     const { active, delta } = event;
     if (!delta.y) return;
     const appointment = active.data.current;
-    const newStartTime = getNewStartTime(appointment.startTime, delta.y, pxPerHour);
+    const newStartTime = getNewStartTime(appointment.startTime, delta.y, PIXELS_PER_HOUR);
     if (onAppointmentMove) onAppointmentMove(appointment.id, newStartTime);
   };
 
   const handleGridClick = (e, dayDate) => {
+    // Evita disparar se clicar no card
     if (e.target.closest('[data-appointment-card]')) return;
+    
     const rect = e.currentTarget.getBoundingClientRect();
-    const offsetY = e.clientY - rect.top + e.currentTarget.scrollTop; 
-    const hoursPassed = offsetY / pxPerHour;
+    const offsetY = e.clientY - rect.top; 
+    
+    const hoursPassed = offsetY / PIXELS_PER_HOUR;
     const hour = Math.floor(hoursPassed) + START_HOUR;
     const minutes = Math.floor((hoursPassed % 1) * 60);
     const roundedMinutes = Math.round(minutes / 15) * 15;
@@ -102,117 +59,135 @@ export function DayView({
     clickedDate = setMinutes(clickedDate, roundedMinutes);
     clickedDate.setSeconds(0);
     clickedDate.setMilliseconds(0);
+    
     if (onTimeSlotClick) onTimeSlotClick(clickedDate);
   };
 
   const getTop = (timeStr) => {
     if (!timeStr || timeStr === "none") return 0;
-    return getPositionFromTime(`2000-01-01T${timeStr}:00`, pxPerHour);
+    // Criamos uma data fictícia apenas para calcular a posição relativa à START_HOUR
+    const dummyDate = `2026-01-01T${timeStr}:00`;
+    return getPositionFromTime(dummyDate, PIXELS_PER_HOUR);
   };
 
   return (
     <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
-      <div className="w-full bg-barber-black border border-zinc-800 rounded-xl overflow-hidden flex flex-col h-full shadow-2xl relative border-t-barber-gold/20">
+      <div className="flex flex-col h-full bg-white rounded-[32px] border border-schedy-border shadow-premium overflow-hidden">
         
-        <div className="bg-zinc-900/95 backdrop-blur-xl border-b border-zinc-800 flex divide-x divide-zinc-800 z-30">
-           <div className="w-16 flex-shrink-0 bg-zinc-900/50"></div>
-           {days.map((day, index) => (
-             <div key={index} className="flex-1 p-3 text-center">
-               <span className="block text-[10px] text-zinc-500 uppercase font-black tracking-widest">{format(day, 'EEEE')}</span>
-               <span className={`block font-black text-lg ${isSameDay(day, new Date()) ? 'text-barber-gold' : 'text-white'}`}>
-                 {format(day, 'MMM dd')}
-               </span>
-             </div>
-           ))}
+        {/* HEADER MINIMALISTA (UMA LINHA) */}
+        <div className="flex items-center justify-between px-8 h-20 border-b border-schedy-border shrink-0 bg-white">
+          <div className="flex items-center gap-4">
+            <div className="bg-schedy-black p-2 rounded-xl text-white">
+              <CalendarIcon size={20} />
+            </div>
+            <h2 className="text-2xl font-black uppercase italic tracking-tighter text-schedy-black">
+              {format(firstDayOfWeek, 'MMMM yyyy')}
+            </h2>
+          </div>
+          
+          <div className="flex items-center bg-schedy-canvas p-1 rounded-2xl border border-schedy-border">
+            <button 
+              onClick={() => onNavigate(addDays(startDate, -7))}
+              className="p-2 hover:bg-white hover:shadow-sm rounded-xl transition-all text-schedy-black"
+            >
+              <ChevronLeft size={20} />
+            </button>
+            <button 
+              onClick={() => onNavigate(new Date())}
+              className="px-4 py-2 text-[10px] font-black uppercase tracking-widest hover:bg-white rounded-xl transition-all"
+            >
+              Today
+            </button>
+            <button 
+              onClick={() => onNavigate(addDays(startDate, 7))}
+              className="p-2 hover:bg-white hover:shadow-sm rounded-xl transition-all text-schedy-black"
+            >
+              <ChevronRight size={20} />
+            </button>
+          </div>
         </div>
 
+        {/* DIAS DA SEMANA (STICKY) */}
+        <div className="flex border-b border-schedy-border bg-white z-20">
+          <div className="w-20 shrink-0 border-r border-schedy-border" />
+          {days.map((day, index) => (
+            <div key={index} className="flex-1 py-4 text-center border-r border-schedy-border last:border-r-0">
+              <span className="block text-[10px] text-schedy-gray uppercase font-black tracking-[0.2em] mb-1">
+                {format(day, 'EEE')}
+              </span>
+              <span className={`
+                inline-flex items-center justify-center w-10 h-10 rounded-full font-black text-lg
+                ${isSameDay(day, new Date()) ? 'bg-schedy-black text-white shadow-vivid' : 'text-schedy-black'}
+              `}>
+                {format(day, 'dd')}
+              </span>
+            </div>
+          ))}
+        </div>
+
+        {/* ÁREA DE SCROLL (GRADE HORÁRIA) */}
         <div 
           ref={scrollContainerRef}
-          className="flex-1 overflow-y-auto relative custom-scrollbar select-none"
-          style={{ scrollBehavior: 'smooth' }}
+          className="flex-1 overflow-y-auto relative bg-white select-none custom-scrollbar"
         >
-          <div className="flex relative" style={{ height: hoursArray.length * pxPerHour }}>
+          <div className="flex relative" style={{ height: hoursArray.length * PIXELS_PER_HOUR }}>
             
-            {/* Linha de Tempo (Agulha) */}
-            <div 
-              className="absolute left-0 w-full z-20 pointer-events-none flex items-center transition-all duration-1000 ease-linear"
-              style={{ top: nowPos }}
-            >
-              <div className="w-16 flex justify-end pr-2">
-                <div className="bg-barber-gold text-black text-[11px] font-extrabold px-2 py-0.5 rounded shadow-[0_0_15px_rgba(197,160,89,0.5)] flex items-center gap-1.5 min-w-[58px] justify-center">
-                  <span className="relative flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-black opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-black"></span>
-                  </span>
-                  {currentTimeStr}
-                </div>
-              </div>
-              <div className="flex-1 border-t-2 border-barber-gold shadow-[0_0_20px_rgba(197,160,89,0.4)]"></div>
-            </div>
-
-            {/* Coluna de Horas (Lateral) */}
-            <div className="w-16 flex-shrink-0 bg-zinc-900/40 border-r border-zinc-800 relative z-10 pointer-events-none">
+            {/* EIXO DE HORAS (FIXO À ESQUERDA) */}
+            <div className="w-20 shrink-0 border-r border-schedy-border bg-white sticky left-0 z-10">
               {hoursArray.map((hour) => (
                 <div 
                   key={hour} 
-                  className="absolute w-full text-right pr-3 text-[10px] font-black text-zinc-600 -mt-2.5" 
-                  style={{ top: (hour - START_HOUR) * pxPerHour }}
+                  className="absolute w-full text-center text-[11px] font-black text-schedy-gray -mt-2.5" 
+                  style={{ top: (hour - START_HOUR) * PIXELS_PER_HOUR }}
                 >
                   {hour.toString().padStart(2, '0')}:00
                 </div>
               ))}
             </div>
 
-            {/* Colunas de Dias */}
+            {/* COLUNAS DOS DIAS */}
             {days.map((day, colIndex) => {
               const dayAppointments = appointments.filter(apt => isSameDay(new Date(apt.startTime), day));
 
               return (
                 <div 
                   key={colIndex} 
-                  className="flex-1 relative border-r border-zinc-800/50 last:border-r-0 cursor-cell hover:bg-white/[0.02] transition-colors" 
+                  className="flex-1 relative border-r border-schedy-border last:border-r-0 hover:bg-schedy-canvas/30 transition-colors" 
                   onClick={(e) => handleGridClick(e, day)}
                 >
-                  {/* Faixas de Horário Comercial (Abertura/Fechamento) */}
-                  {businessHours && (
-                    <>
-                      <div className="absolute w-full bg-black/50 z-0 pointer-events-none" style={{ top: 0, height: getTop(businessHours.open) }} />
-                      <div className="absolute w-full bg-black/50 z-0 pointer-events-none" style={{ top: getTop(businessHours.close), bottom: 0 }} />
-                      
-                      {/* LÓGICA DO BREAK (PAUSA) */}
-                      {businessHours.break && businessHours.break !== "none" && (
-                        (() => {
-                          const [bStart, bEnd] = businessHours.break.split('-');
-                          const bTop = getTop(bStart);
-                          const bBottom = getTop(bEnd);
-                          return (
-                            <div
-                              className="absolute w-full bg-zinc-800/40 z-0 pointer-events-none flex items-center justify-center border-y border-zinc-700/20"
-                              style={{ top: bTop, height: bBottom - bTop }}
-                            >
-                              <span className="text-[9px] font-black uppercase tracking-[0.3em] text-zinc-600 italic">Pause / Break</span>
-                            </div>
-                          );
-                        })()
-                      )}
-                    </>
-                  )}
-
-                  {/* Linhas Horizontais do Grid */}
+                  {/* LINHAS HORIZONTAIS DE FUNDO */}
                   {hoursArray.map((hour) => (
                     <div 
                       key={hour} 
-                      className="absolute w-full border-b border-zinc-800/40 pointer-events-none" 
-                      style={{ top: (hour - START_HOUR) * pxPerHour, height: pxPerHour }} 
+                      className="absolute w-full border-b border-schedy-border/50" 
+                      style={{ top: (hour - START_HOUR) * PIXELS_PER_HOUR, height: PIXELS_PER_HOUR }} 
                     />
                   ))}
 
-                  {/* Renderização dos Cards de Agendamento */}
+                  {/* FAIXA DE BREAK (OPCIONAL) */}
+                  {businessHours?.break && (
+                    (() => {
+                      const [bStart, bEnd] = businessHours.break.split('-');
+                      const bTop = getTop(bStart);
+                      const bHeight = getTop(bEnd) - bTop;
+                      return (
+                        <div
+                          className="absolute w-full bg-schedy-canvas/50 z-0 pointer-events-none flex items-center justify-center border-y border-schedy-border/30"
+                          style={{ top: bTop, height: bHeight }}
+                        >
+                          <span className="text-[8px] font-black uppercase tracking-[0.4em] text-schedy-gray/40 rotate-90 lg:rotate-0">
+                            Closed
+                          </span>
+                        </div>
+                      );
+                    })()
+                  )}
+
+                  {/* CARDS DE AGENDAMENTO */}
                   {dayAppointments.map((apt) => (
                     <div key={apt.id} data-appointment-card>
                         <AppointmentCard 
                           appointment={apt} 
-                          customPxPerHour={pxPerHour}
                           onComplete={onComplete} 
                           onDelete={onDelete}     
                           onClick={(e) => { 
@@ -226,12 +201,6 @@ export function DayView({
               );
             })}
           </div>
-        </div>
-        
-        <div className="bg-barber-black p-2 text-center border-t border-zinc-800 z-30">
-            <p className="text-[9px] text-barber-gold font-black uppercase tracking-[0.3em] animate-pulse">
-              System Live • Polling Active (10s) • {timezone}
-            </p>
         </div>
       </div>
     </DndContext>

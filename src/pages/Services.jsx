@@ -3,7 +3,7 @@ import { AppLayout } from '../components/ui/AppLayout';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { Modal } from '../components/ui/Modal';
-import { Plus, Trash2, Clock, DollarSign, Pencil } from 'lucide-react'; 
+import { Plus, Trash2, Clock, DollarSign, Pencil, Check } from 'lucide-react'; 
 import { 
     addService, 
     getServices, 
@@ -12,17 +12,29 @@ import {
     getProfessionalProfile 
 } from '../services/professionalService'; 
 
+// Paleta definida no tailwind.config.js
+const SERVICE_COLORS = [
+  { id: 'emerald', bg: 'bg-service-emerald', label: 'Verde' },
+  { id: 'amber',   bg: 'bg-service-amber',   label: 'Amarelo' },
+  { id: 'indigo',  bg: 'bg-service-indigo',  label: 'Roxo' },
+  { id: 'rose',    bg: 'bg-service-rose',    label: 'Rosa' },
+  { id: 'violet',  bg: 'bg-service-violet',  label: 'Violeta' },
+  { id: 'sky',     bg: 'bg-service-sky',     label: 'Azul' },
+  { id: 'orange',  bg: 'bg-service-orange',  label: 'Laranja' },
+];
+
 export function Services() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [services, setServices] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [currency, setCurrency] = useState('$'); // Moeda padrão
+  const [currency, setCurrency] = useState('$');
   
   // Estados do Formulário
   const [editingService, setEditingService] = useState(null); 
   const [name, setName] = useState('');
   const [price, setPrice] = useState('');
   const [duration, setDuration] = useState('30');
+  const [color, setColor] = useState('emerald'); // Cor padrão
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -31,22 +43,9 @@ export function Services() {
 
   const loadServices = async () => {
     try {
-      // 1. BUSCA O PERFIL PARA DEFINIR A MOEDA DINÂMICA
       const profile = await getProfessionalProfile();
-      if (profile) {
-        // Se o perfil já tiver a moeda salva (como configuramos no Registro/Profile), usamos ela.
-        // Caso contrário, mantemos o fallback baseado no país para contas antigas.
-        if (profile.currency) {
-          setCurrency(profile.currency);
-        } else {
-          let fallbackCurrency = '$'; 
-          if (profile.country === 'BR') fallbackCurrency = 'R$';
-          if (profile.country === 'PT') fallbackCurrency = '€';
-          setCurrency(fallbackCurrency);
-        }
-      }
-
-      // 2. BUSCA A LISTA DE SERVIÇOS
+      if (profile?.currency) setCurrency(profile.currency);
+      
       const data = await getServices();
       setServices(data);
     } catch (error) {
@@ -56,21 +55,21 @@ export function Services() {
     }
   };
 
-  // Abre o modal para CRIAR (Preservado)
   const handleNewService = () => {
     setEditingService(null);
     setName('');
     setPrice('');
     setDuration('30');
+    setColor('emerald');
     setIsModalOpen(true);
   };
 
-  // Abre o modal para EDITAR (Preservado)
   const handleEditService = (service) => {
     setEditingService(service);
     setName(service.name);
     setPrice(service.price.toString());
     setDuration(service.duration.toString());
+    setColor(service.color || 'emerald');
     setIsModalOpen(true);
   };
 
@@ -81,7 +80,8 @@ export function Services() {
       const serviceData = {
         name,
         price: parseFloat(price),
-        duration: parseInt(duration)
+        duration: parseInt(duration),
+        color // Salvamos a cor escolhida
       };
 
       if (editingService) {
@@ -100,7 +100,7 @@ export function Services() {
   };
 
   const handleDelete = async (id) => {
-    if (confirm("Are you sure you want to delete this service?")) {
+    if (confirm("Deseja realmente excluir este serviço?")) {
       await deleteService(id);
       loadServices();
     }
@@ -108,48 +108,56 @@ export function Services() {
 
   return (
     <AppLayout>
-      <header className="flex items-center justify-between mb-8">
+      <header className="flex items-center justify-between mb-10">
         <div>
-          <h1 className="text-2xl font-bold text-barber-white">My Services</h1>
-          <p className="text-barber-gray text-sm">Manage your catalog and pricing</p>
+          <h1 className="text-3xl font-black text-schedy-black tracking-tighter uppercase italic">Meus Serviços</h1>
+          <p className="text-schedy-gray text-xs font-bold uppercase tracking-widest">Catálogo e Precificação</p>
         </div>
-        <Button className="w-auto gap-2" onClick={handleNewService}>
-          <Plus size={20} /> New Service
+        <Button className="w-auto gap-2 h-12 px-6 shadow-vivid" onClick={handleNewService}>
+          <Plus size={20} /> Novo Serviço
         </Button>
       </header>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {loading ? (
-          <p className="text-barber-gray animate-pulse">Loading services...</p>
+          <div className="col-span-3 py-20 flex justify-center">
+            <div className="w-8 h-8 border-4 border-schedy-black border-t-transparent rounded-full animate-spin"></div>
+          </div>
         ) : services.length === 0 ? (
-          <div className="col-span-3 text-center py-10 text-barber-gray border border-dashed border-zinc-800 rounded-xl">
-            No services registered yet.
+          <div className="col-span-3 text-center py-20 bg-white border-2 border-dashed border-schedy-border rounded-[32px]">
+            <p className="text-schedy-gray font-bold uppercase tracking-widest text-sm">Nenhum serviço cadastrado.</p>
           </div>
         ) : (
           services.map((service) => (
-            <div key={service.id} className="bg-barber-black border border-zinc-800 p-5 rounded-2xl flex justify-between items-center group hover:border-barber-gold transition-all shadow-lg">
-              <div>
-                <h3 className="font-bold text-barber-white text-lg">{service.name}</h3>
-                <div className="flex gap-4 mt-2 text-sm text-barber-gray">
-                  {/* EXIBIÇÃO DA MOEDA DINÂMICA */}
-                  <span className="flex items-center gap-1 font-medium text-barber-gold">
-                    <DollarSign size={14}/> {currency}{service.price}
+            <div 
+              key={service.id} 
+              className="bg-white border border-schedy-border p-6 rounded-[32px] flex justify-between items-center group hover:shadow-premium transition-all relative overflow-hidden"
+            >
+              {/* Barra de cor lateral - O toque UAU */}
+              <div className={`absolute left-0 top-0 bottom-0 w-2 bg-service-${service.color || 'emerald'}`} />
+
+              <div className="pl-2">
+                <h3 className="font-black text-schedy-black text-xl tracking-tight uppercase italic">{service.name}</h3>
+                <div className="flex gap-4 mt-3 text-xs font-black uppercase tracking-widest">
+                  <span className={`text-service-${service.color || 'emerald'} flex items-center gap-1`}>
+                    {currency}{service.price}
                   </span>
-                  <span className="flex items-center gap-1">
-                    <Clock size={14}/> {service.duration} min
+                  <span className="text-schedy-gray flex items-center gap-1">
+                    <Clock size={14}/> {service.duration} MIN
                   </span>
                 </div>
               </div>
-              <div className="flex gap-1">
+              
+              <div className="flex gap-2">
                 <button 
                   onClick={() => handleEditService(service)}
-                  className="text-zinc-500 hover:text-barber-gold transition-colors p-2 rounded-lg hover:bg-barber-gold/10"
+                  className="p-3 bg-schedy-canvas text-schedy-black rounded-2xl hover:bg-schedy-black hover:text-white transition-all"
                 >
                   <Pencil size={18} />
                 </button>
                 <button 
                   onClick={() => handleDelete(service.id)}
-                  className="text-zinc-500 hover:text-red-500 transition-colors p-2 rounded-lg hover:bg-red-500/10"
+                  className="p-3 bg-red-50 text-schedy-danger rounded-2xl hover:bg-schedy-danger hover:text-white transition-all"
                 >
                   <Trash2 size={18} />
                 </button>
@@ -162,21 +170,20 @@ export function Services() {
       <Modal 
         isOpen={isModalOpen} 
         onClose={() => setIsModalOpen(false)}
-        title={editingService ? "Edit Service" : "New Service"}
+        title={editingService ? "Editar Serviço" : "Novo Serviço"}
       >
-        <form onSubmit={handleSave} className="flex flex-col gap-4">
+        <form onSubmit={handleSave} className="flex flex-col gap-6">
           <Input 
-            label="Service Name" 
-            placeholder="Ex: Haircut" 
+            label="Nome do Serviço" 
+            placeholder="Ex: Corte Degradê" 
             value={name}
             onChange={e => setName(e.target.value)}
             required
           />
           
           <div className="flex gap-4">
-            {/* LABEL DA MOEDA DINÂMICA NO INPUT */}
             <Input 
-              label={`Price (${currency})`} 
+              label={`Preço (${currency})`} 
               type="number" 
               step="0.01" 
               placeholder="30.00" 
@@ -185,24 +192,42 @@ export function Services() {
               required
             />
             <div className="w-full">
-              <label className="text-sm text-barber-gray font-medium mb-1 block">Duration</label>
+              <label className="text-[10px] text-schedy-gray font-black uppercase tracking-widest mb-2 block">Duração</label>
               <select 
-                className="w-full bg-barber-black border border-zinc-800 rounded-lg p-3 text-barber-white focus:border-barber-gold outline-none transition-all"
+                className="w-full bg-schedy-canvas border border-schedy-border rounded-xl p-3 text-sm font-bold focus:border-schedy-black outline-none appearance-none"
                 value={duration}
                 onChange={e => setDuration(e.target.value)}
               >
-                <option value="15">15 min</option>
-                <option value="30">30 min</option>
-                <option value="45">45 min</option>
-                <option value="60">1 hour</option>
-                <option value="90">1h 30min</option>
-                <option value="120">2 hours</option>
+                {[15, 30, 45, 60, 90, 120].map(m => (
+                    <option key={m} value={m}>{m === 60 ? '1 HORA' : m > 60 ? '1H 30MIN' : `${m} MIN`}</option>
+                ))}
               </select>
             </div>
           </div>
 
-          <Button type="submit" loading={saving} className="mt-4 h-14 font-bold uppercase tracking-widest">
-            {editingService ? "Update Service" : "Create Service"}
+          {/* SELETOR DE CORES VIVAS */}
+          <div>
+            <label className="text-[10px] text-schedy-gray font-black uppercase tracking-widest mb-3 block">Identificador Visual (Cor do Card)</label>
+            <div className="grid grid-cols-7 gap-3">
+              {SERVICE_COLORS.map((c) => (
+                <button
+                  key={c.id}
+                  type="button"
+                  onClick={() => setColor(c.id)}
+                  className={`
+                    h-10 rounded-xl transition-all flex items-center justify-center
+                    ${c.bg} 
+                    ${color === c.id ? 'ring-4 ring-schedy-black scale-110 shadow-lg' : 'opacity-60 hover:opacity-100'}
+                  `}
+                >
+                  {color === c.id && <Check size={20} className="text-white" />}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <Button type="submit" loading={saving} className="mt-4 h-16 text-lg font-black uppercase italic tracking-tighter shadow-vivid">
+            {editingService ? "Atualizar Catálogo" : "Salvar Serviço"}
           </Button>
         </form>
       </Modal>

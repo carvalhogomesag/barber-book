@@ -1,23 +1,27 @@
 import React from 'react';
 import { useDraggable } from '@dnd-kit/core';
 import { CSS } from '@dnd-kit/utilities';
-import { AlertCircle, Lock } from 'lucide-react'; 
+import { AlertCircle, Lock, Phone } from 'lucide-react'; 
 import { 
   getPositionFromTime, 
   getHeightFromDuration, 
   getNewStartTime,    
-  formatTimeDisplay   
+  formatTimeDisplay,
+  PIXELS_PER_HOUR
 } from '../../utils/timeGrid';
 
-export function AppointmentCard({ appointment, onClick, style: propStyle, customPxPerHour }) {
+export function AppointmentCard({ appointment, onClick }) {
   
-  const top = getPositionFromTime(appointment.startTime, customPxPerHour);
-  const height = getHeightFromDuration(appointment.duration, customPxPerHour);
+  // Cálculo de posição e altura baseados no novo grid de 100px/hora
+  const top = getPositionFromTime(appointment.startTime, PIXELS_PER_HOUR);
+  const height = getHeightFromDuration(appointment.duration, PIXELS_PER_HOUR);
+  
   const isCompleted = appointment.status === 'completed';
   const isBlocked = appointment.type === 'block'; 
-  
-  // Verifica se existem notas/observações para ativar o alerta
   const hasNotes = appointment.notes && appointment.notes.trim().length > 0;
+  
+  // Cor dinâmica vinda do Firestore (campo color do serviço)
+  const serviceColor = appointment.color || 'emerald';
 
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: appointment.id,
@@ -25,95 +29,93 @@ export function AppointmentCard({ appointment, onClick, style: propStyle, custom
     disabled: isCompleted 
   });
 
+  // Feedback visual de tempo durante o arraste
   let displayTime = formatTimeDisplay(appointment.startTime);
-  
   if (isDragging && transform) {
-    const projectedTimeISO = getNewStartTime(appointment.startTime, transform.y, customPxPerHour);
+    const projectedTimeISO = getNewStartTime(appointment.startTime, transform.y, PIXELS_PER_HOUR);
     displayTime = formatTimeDisplay(projectedTimeISO);
   }
 
-  const showDetails = height >= 35;
+  // Hierarquia visual baseada na altura do card
+  const isLarge = height >= 70; // 45min ou mais
+  const isMedium = height >= 45; // 30min
 
   const style = {
     top: `${top}px`,
-    height: `${height}px`,
+    height: `${height - 2}px`, // Pequeno gap entre cards
     zIndex: isDragging ? 100 : 10, 
     transform: CSS.Translate.toString(transform),
-    opacity: isDragging ? 0.9 : (isCompleted ? 0.6 : 1), 
     position: 'absolute',
     left: '4px',  
     right: '4px', 
     touchAction: 'none',
-    ...propStyle 
   };
 
   return (
     <div
       ref={setNodeRef}
       style={style}
-      // hover:z-[50] garante que o card focado fique visualmente acima dos outros
-      className="group hover:z-[50] transition-all duration-75"
+      className="group"
     >
-      {/* 
-          BARRA FLUTUANTE REMOVIDA 
-          A edição agora é feita exclusivamente clicando no card abaixo.
-      */}
-
-      {/* CARD PRINCIPAL - CLICÁVEL PARA ABRIR O MODAL */}
       <div
         {...listeners}
         {...attributes}
-        onClick={(e) => {
-          // IMPORTANTE: Passamos o evento 'e' para o onClick original do DayView
-          if (onClick) onClick(e);
-        }}
+        onClick={(e) => onClick(e)}
         className={`
-          w-full h-full rounded-lg border-l-4 transition-all duration-200 overflow-hidden relative
+          w-full h-full rounded-2xl transition-all duration-200 overflow-hidden relative shadow-sm
           ${isDragging 
-            ? 'bg-barber-gold text-barber-black border-barber-white shadow-2xl scale-[1.02] cursor-grabbing'
+            ? 'ring-4 ring-schedy-black shadow-vivid scale-[1.02] z-[100] cursor-grabbing'
             : isCompleted
-              ? 'bg-zinc-900 border-zinc-700 cursor-default'
+              ? 'bg-schedy-border opacity-40 grayscale cursor-default'
               : isBlocked
-                ? 'bg-zinc-900/80 border-zinc-500 hover:bg-zinc-800 cursor-pointer' 
-                : hasNotes 
-                  ? 'bg-zinc-800 border-barber-gold animate-pulse-gold shadow-[0_0_15px_rgba(197,160,89,0.3)]' 
-                  : 'bg-zinc-800/90 border-barber-red hover:bg-zinc-700 cursor-pointer shadow-md'
+                ? 'bg-schedy-gray border-2 border-dashed border-schedy-border cursor-not-allowed'
+                : `bg-service-${serviceColor} hover:shadow-vivid hover:-translate-y-0.5 cursor-pointer`
           }
         `}
       >
-        {/* pointer-events-none garante que o clique seja detectado pelo container pai */}
-        <div className="flex justify-between items-center p-2 relative h-full w-full pointer-events-none">
-          {/* Badge Visual de Notas */}
-          {hasNotes && !isCompleted && !isDragging && (
-            <div className="absolute top-1 right-1 text-barber-gold">
-              <AlertCircle size={10} fill="currentColor" className="text-black" />
-            </div>
-          )}
+        <div className="p-3 flex flex-col h-full pointer-events-none text-white">
+          
+          {/* TOPO: Hora e Alerta */}
+          <div className="flex justify-between items-start mb-1">
+            <span className={`font-black tracking-tighter italic ${isLarge ? 'text-sm' : 'text-[10px]'}`}>
+              {displayTime}
+            </span>
+            {hasNotes && !isDragging && (
+              <AlertCircle size={isMedium ? 14 : 10} className="text-white/80" />
+            )}
+          </div>
 
-          <div className={`flex flex-col justify-center min-w-0 ${isDragging ? 'opacity-20' : ''}`}>
-            <h4 className={`font-bold text-sm leading-tight truncate flex items-center gap-1.5 ${isCompleted ? 'text-zinc-500 line-through' : 'text-barber-white'}`}>
-              {isBlocked && <Lock size={12} className="text-zinc-500" />}
+          {/* MEIO: Nome do Cliente */}
+          <div className="min-w-0 flex-1">
+            <h4 className={`font-black uppercase italic leading-tight truncate ${isLarge ? 'text-sm' : 'text-[11px]'}`}>
+              {isBlocked && <Lock size={12} className="inline mr-1" />}
               {appointment.clientName}
             </h4>
-            {showDetails && (
-              <p className={`text-[10px] mt-0.5 truncate ${isCompleted ? 'text-zinc-600' : 'text-barber-gray'}`}>
+            
+            {/* DETALHES: Serviço e Telefone (Apenas se houver espaço) */}
+            {isMedium && (
+              <p className="text-[9px] font-bold opacity-90 uppercase truncate mt-0.5">
                 {appointment.serviceName}
               </p>
             )}
           </div>
 
-          <div className={`flex flex-col items-end flex-shrink-0 ml-2 ${isDragging ? 'opacity-20' : ''}`}>
-            {showDetails && !isCompleted && !isBlocked && (
-              <span className={`text-[9px] font-black px-1.5 py-0.5 rounded ${hasNotes ? 'bg-barber-gold text-black' : 'bg-barber-black/50 text-barber-gold'}`}>
-                ${appointment.price}
+          {/* RODAPÉ: Telefone (Apenas se for card grande) */}
+          {isLarge && appointment.clientPhone && (
+            <div className="flex items-center gap-1 mt-auto pt-1 border-t border-white/20">
+              <Phone size={8} />
+              <span className="text-[8px] font-bold tabular-nums">
+                {appointment.clientPhone}
               </span>
-            )}
-            {!isDragging && (
-              <span className={`text-[10px] mt-1 ${isCompleted ? 'text-zinc-600' : 'text-barber-white font-bold'}`}>
-                {displayTime}
-              </span>
-            )}
-          </div>
+            </div>
+          )}
+
+          {/* Overlay de Concluído */}
+          {isCompleted && (
+            <div className="absolute inset-0 bg-white/20 flex items-center justify-center">
+               <span className="text-[10px] font-black uppercase text-schedy-black bg-white px-2 py-1 rounded-lg">Done</span>
+            </div>
+          )}
         </div>
       </div>
     </div>
