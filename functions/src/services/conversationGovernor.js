@@ -1,55 +1,58 @@
 const admin = require("firebase-admin");
 
 /**
- * CONVERSATION GOVERNOR (Princípio 7)
- * Monitora a saúde da conversa e impede loops infinitos.
+ * functions/src/services/conversationGovernor.js
+ * Monitor de Saúde e Escalação Determinística (Princípio 7)
  */
 const conversationGovernor = {
-  // Aumentado de 6 para 10 conforme solicitação de teste de estresse
+  // Limite operacional para evitar loops de custo/alucinação
   MAX_INTERACTIONS: 10,
 
   /**
-   * Avalia se a conversa deve ser transferida para um humano.
-   * Regra: Se count >= limite E estado não for final (CONFIRMED/CANCELLED)
+   * Avalia se a conversa deve sofrer transbordo para um humano.
+   * Regra: Se interactionCount >= MAX_INTERACTIONS e o estado não for resolutivo.
    */
   async evaluateEscalation(barberId, clientPhone, interactionCount, currentBookingState) {
     const db = admin.firestore();
     const timestamp = new Date().toISOString();
 
-    // Verificamos se o estado atual é um estado "Resolvido" (Finalizado)
-    const isResolved = currentBookingState === 'CONFIRMED' || currentBookingState === 'CANCELLED';
+    // Estados que indicam que a IA concluiu sua missão técnica
+    const isResolved = ['CONFIRMED', 'scheduled', 'CANCELLED'].includes(currentBookingState);
     
-    // O gatilho dispara quando o contador atinge ou ultrapassa o limite
+    // Disparo do gatilho de segurança
     const isLimitExceeded = interactionCount >= this.MAX_INTERACTIONS;
 
+    // Só escalamos se exceder o limite E não estiver em um estado de sucesso/conclusão
     if (isLimitExceeded && !isResolved) {
-      console.warn(`[GOVERNOR] Escalonamento ativado para ${clientPhone}. Limite de ${this.MAX_INTERACTIONS} interações atingido.`);
+      console.warn(`[GOVERNOR] Limite de segurança atingido para ${clientPhone}. Iniciando Transbordo.`);
 
-      // 1. Criar registro global em notifications/ para auditoria administrativa
-      await db.collection("notifications").add({
+      const batch = db.batch();
+
+      // 1. Registro em coleções globais de auditoria
+      const notifRef = db.collection("notifications").doc();
+      batch.set(notifRef, {
         type: "human_intervention_required",
         reason: "MAX_INTERACTIONS_EXCEEDED",
         barberId,
         clientPhone,
-        lastBookingState: currentBookingState || "NONE",
         interactionCount,
-        limitSet: this.MAX_INTERACTIONS,
         createdAt: timestamp
       });
 
-      // 2. Criar Alerta na subcoleção do Barbeiro para notificação no Dashboard
-      await db.collection("barbers").doc(barberId).collection("alerts").add({
+      // 2. Alerta imediato no Dashboard do Barbeiro
+      const alertRef = db.collection("barbers").doc(barberId).collection("alerts").doc();
+      batch.set(alertRef, {
         type: "ATTENTION_REQUIRED",
         reason: "IA_STUCK",
         clientPhone,
-        description: `A IA atingiu o limite de ${this.MAX_INTERACTIONS} interações sem finalizar o agendamento. Transbordo manual ativado.`,
+        description: `O cliente atingiu o limite de ${this.MAX_INTERACTIONS} interações. Assuma o atendimento manualmente.`,
         createdAt: timestamp,
         resolved: false
       });
 
-      // 3. Pausar a IA no mapeamento do cliente para silenciar o bot
+      // 3. Travamento de segurança (Pause AI) no Mapeamento
       const mappingRef = db.collection("customer_mappings").doc(clientPhone);
-      await mappingRef.set({
+      batch.set(mappingRef, {
         tenants: {
           [barberId]: {
             status: 'paused',
@@ -59,13 +62,43 @@ const conversationGovernor = {
         }
       }, { merge: true });
 
+      await batch.commit();
+
       return { 
         shouldEscalate: true, 
-        fallbackMessage: "Notei que ainda não finalizamos seu pedido. Para sua comodidade, vou passar a conversa para o profissional te ajudar agora! 🤖" 
+        fallbackMessage: "Entendido. Para garantir que seu agendamento seja perfeito, vou passar a conversa para o profissional te ajudar agora! 🤖" 
       };
     }
 
     return { shouldEscalate: false };
+  },
+
+  /**
+   * Reseta o contador de interações do cliente.
+   * Chamado quando uma transação no Firestore (Agendar/Alterar/Cancelar) tem sucesso.
+   */
+  async resetGovernor(clientPhone, barberId) {
+    const db = admin.firestore();
+    const timestamp = new Date().toISOString();
+    
+    try {
+      const mappingRef = db.collection("customer_mappings").doc(clientPhone);
+      await mappingRef.set({
+        tenants: {
+          [barberId]: {
+            interactionCount: 0,
+            lastInteraction: timestamp,
+            status: 'active' // Garante que a IA seja reativada se estiver agendando
+          }
+        }
+      }, { merge: true });
+      
+      console.log(`[GOVERNOR RESET] Contador zerado com sucesso para ${clientPhone}.`);
+      return true;
+    } catch (error) {
+      console.error("[GOVERNOR RESET ERROR]", error);
+      return false;
+    }
   }
 };
 
