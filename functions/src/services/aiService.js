@@ -5,7 +5,7 @@ const { getSchedulerContext } = require("../../utils");
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
 // --- HITL: PALAVRAS-CHAVE PARA INTERVENÇÃO HUMANA ---
-const HUMAN_HANDOFF_KEYWORDS = [
+const HUMAN_HANDOFF_KEYWORDS =[
   "falar com humano", "atendente", "falar com pessoa", "humano", "erro", 
   "não estou conseguindo", "burro", "estúpido", "idiota", "human", 
   "speak to person", "agent", "operator", "stupid", "error", "help me"
@@ -31,7 +31,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
       await mappingRef.update({ clientName: args.name });
       const customerRef = db.collection("barbers").doc(barberId).collection("customers").doc(fromNumber);
       await customerRef.set({ name: args.name, phone: fromNumber, updatedAt: new Date().toISOString() }, { merge: true });
-      return `SUCCESS: Client name saved as ${args.name}.`;
+      return `SUCCESS: Client name saved as ${args.name}. YOU MUST USE THIS NAME FROM NOW ON.`;
     },
 
     update_customer_data: async (args) => {
@@ -42,7 +42,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
     
     get_realtime_agenda: async () => {
       const snap = await db.collection("barbers").doc(barberId).collection("appointments")
-        .where("status", "in", ["CONFIRMED", "scheduled", "PENDING"])
+        .where("status", "in",["CONFIRMED", "scheduled", "PENDING"])
         .get();
         
       if (snap.empty) return "VERDICT: Database is EMPTY.";
@@ -100,7 +100,7 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
 
     delete_appointment: async (args) => {
       const ref = db.collection("barbers").doc(barberId).collection("appointments");
-      const snapshot = await ref.where("clientPhone", "==", fromNumber).where("status", "in", ["CONFIRMED", "scheduled"]).limit(1).get();
+      const snapshot = await ref.where("clientPhone", "==", fromNumber).where("status", "in",["CONFIRMED", "scheduled"]).limit(1).get();
       if (snapshot.empty) return "ERROR: NOT_FOUND";
       await snapshot.docs[0].ref.update({ status: "CANCELLED", updatedAt: new Date().toISOString() });
       return "SUCCESS: CANCELLED";
@@ -108,18 +108,15 @@ const setupTools = (db, barberId, timezone, mappingRef, fromNumber) => {
   };
 };
 
-const toolsDeclaration = [
+const toolsDeclaration =[
   { name: "save_client_identity", description: "Registers client name.", parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
   { name: "update_customer_data", description: "Saves CRM data.", parameters: { type: "object", properties: { preferences: { type: "string" }, notes: { type: "string" }, birthday: { type: "string" } } } },
-  { name: "get_realtime_agenda", description: "Mandatory check for busy slots." },
-  { name: "create_appointment", description: "Persists NEW booking.", parameters: { type: "object", properties: { clientName: { type: "string" }, serviceName: { type: "string" }, startTime: { type: "string" }, price: { type: "number" }, duration: { type: "number" } }, required: ["clientName", "serviceName", "startTime", "duration"] } },
+  { name: "get_realtime_agenda", description: "Checks busy slots." },
+  { name: "create_appointment", description: "Persists NEW booking.", parameters: { type: "object", properties: { clientName: { type: "string" }, serviceName: { type: "string" }, startTime: { type: "string" }, price: { type: "number" }, duration: { type: "number" } }, required:["clientName", "serviceName", "startTime", "duration"] } },
   { name: "update_appointment", description: "Changes booking time.", parameters: { type: "object", properties: { newStartTime: { type: "string" } }, required: ["newStartTime"] } },
   { name: "delete_appointment", description: "Cancels booking." }
 ];
 
-/**
- * FUNÇÃO AUXILIAR DE RETENTATIVA
- */
 const sendMessageWithRetry = async (chat, message, retries = 2) => {
     for (let i = 0; i <= retries; i++) {
         try {
@@ -137,7 +134,7 @@ const sendMessageWithRetry = async (chat, message, retries = 2) => {
 };
 
 /**
- * LÓGICA PRINCIPAL (REFINADA: PROTOCOLO 4 PILARES + GROUNDING DE FOLGAS)
+ * LÓGICA PRINCIPAL (REFINADA: COGNITIVE LOCKS)
  */
 exports.processMessageWithAI = async ({ 
     barberId, barberData, clientName, messageBody, fromNumber, 
@@ -177,28 +174,25 @@ exports.processMessageWithAI = async ({
         const scheduler = getSchedulerContext(timezone);
         const tools = setupTools(db, barberId, timezone, mappingRef, fromNumber);
         
-        // Validação Rígida de Dias de Trabalho (Off-Day Shield)
-        const workDays = barberData.settings?.businessHours?.days || [1, 2, 3, 4, 5];
+        const workDays = barberData.settings?.businessHours?.days ||[1, 2, 3, 4, 5];
         const validatedDateMenu = scheduler.dateMenu.map(d => {
             const isOpen = workDays.includes(d.dayOfWeek);
-            return `${d.option}) ${d.label} (${d.iso}) - Status: ${isOpen ? '[ABERTO]' : '[FECHADO/FOLGA - NÃO AGENDAR]'}`;
+            return `${d.option}) ${d.label} (${d.iso}) - Status: ${isOpen ? '[ABERTO]' : '[FECHADO - NÃO AGENDAR]'}`;
         }).join('\n');
 
-        // --- 3. MASTER PROMPT TRANSACIONAL (PROTOCOLO 4 PILARES) ---
+        // --- 3. MASTER PROMPT TRANSACIONAL (COGNITIVE LOCKS ATIVADOS) ---
         const MASTER_PROMPT = `
-You are Schedy AI, the deterministic concierge for "${barberData.barberShopName}".
-Your mission is to fulfill a 4-pillar booking form before confirming any action.
+You are Schedy AI, the precise concierge for "${barberData.barberShopName}".
 
---- THE 4 MANDATORY PILLARS ---
-1. CLIENT NAME: ${clientName || "Unknown"} (Ask if unknown).
-2. SERVICE TYPE: Strictly from the list below.
-3. DATE: Strictly from the [ABERTO] dates below.
-4. TIME: Strictly free slots during business hours.
+--- CRITICAL COGNITIVE LOCKS (OBEY OR FAIL) ---
+RULE 1 (IDENTITY LOCK): The current Client Name is [${clientName || "UNKNOWN"}]. If it says UNKNOWN and the user types their name, your VERY FIRST ACTION MUST BE to call the 'save_client_identity' tool. Do not proceed until you call it.
+RULE 2 (MEMORY LOCK): Once the user chooses a Date (e.g., Monday) or Time, DO NOT change it unless the user explicitly asks to alter it. Maintain the chosen date in your context.
+RULE 3 (DAY OFF LOCK): Only suggest dates marked as [ABERTO] below. Never suggest [FECHADO].
+RULE 4 (SUMMARY LOCK): You cannot call 'create_appointment' without presenting a summary ("Can I confirm [SERVICE] for [NAME] on [DATE] at [TIME]?") and receiving a "Yes".
 
---- BUSINESS CALENDAR (SINGLE SOURCE OF TRUTH) ---
+--- BUSINESS CALENDAR (SOURCE OF TRUTH) ---
 Current Local Time: ${scheduler.currentTimeLocal} | Today: ${scheduler.hojeLocalISO}
-
-Available Dates (Only suggest [ABERTO] days):
+Available Dates (ONLY book [ABERTO] days):
 ${validatedDateMenu}
 
 Business Hours: ${barberData.settings?.businessHours?.open} to ${barberData.settings?.businessHours?.close}
@@ -208,12 +202,6 @@ ${busySlotsString || "None."}
 --- SERVICES ---
 ${techServices}
 
---- DATA INTEGRITY PROTOCOL ---
-1. DAY OFF RULE: If a user asks for a [FECHADO/FOLGA] date, you MUST politely state the shop is closed and suggest the next [ABERTO] day.
-2. TRUTH OVER HISTORY: Use only "CURRENT SYSTEM STATE" for booking status.
-3. CONFIRMATION: When all 4 pillars are clear, you MUST present a final summary and ask: "Can I confirm [SERVICE] for [NAME] on [DATE] at [TIME]?".
-4. EXECUTION: Only call 'create_appointment' AFTER the user explicitly says "Yes" or "Confirm".
-
 Language: ${targetLanguage}.
 ${isVoiceMode ? "- VOICE MODE: Very short phrases, natural spoken dates." : ""}
 `;
@@ -221,29 +209,24 @@ ${isVoiceMode ? "- VOICE MODE: Very short phrases, natural spoken dates." : ""}
         const model = genAI.getGenerativeModel({ 
             model: GEMINI_MODEL, 
             systemInstruction: MASTER_PROMPT + (globalAIConfig?.additionalContext || ""),
-            tools: [{ functionDeclarations: toolsDeclaration }] 
+            tools:[{ functionDeclarations: toolsDeclaration }] 
         });
 
-        let history = (await chatRef.get()).data()?.history || [];
+        let history = (await chatRef.get()).data()?.history ||[];
         const chat = model.startChat({ history: history.slice(-6) }); 
         const finalInput = isInitialMessage ? `Greeting: Scanned QR for ${barberData.barberShopName}.` : userMessage;
 
-        // EXECUÇÃO COM RESILIÊNCIA
         let result = await sendMessageWithRetry(chat, finalInput); 
         let responseText = result.response.text();
         let calls = result.response.functionCalls();
 
-        // 4. CHAIN OF THOUGHT (Execution Layer)
-        let errorCount = 0;
         while (calls && calls.length > 0) {
-            const responses = [];
+            const responses =[];
             for (const call of calls) {
                 try {
                     const toolResult = await tools[call.name](call.args);
-                    if (toolResult.includes("ERROR")) errorCount++;
                     responses.push({ functionResponse: { name: call.name, response: { content: toolResult } } });
                 } catch (e) {
-                    errorCount++;
                     responses.push({ functionResponse: { name: call.name, response: { content: "SYSTEM_ERROR" } } });
                 }
             }
@@ -252,10 +235,8 @@ ${isVoiceMode ? "- VOICE MODE: Very short phrases, natural spoken dates." : ""}
             calls = result.response.functionCalls();
         }
 
-        if (errorCount >= 2) responseText += " [PAUSE_AI]";
         if (isVoiceMode) responseText = responseText.replace(/\*/g, '').replace(/#/g, '').trim();
 
-        // 5. PERSISTÊNCIA
         await chatRef.set({ 
             history: [...history, { role: "user", parts: [{ text: userMessage }] }, { role: "model", parts: [{ text: responseText }] }].slice(-20),
             lastMessage: userMessage, 
@@ -265,7 +246,7 @@ ${isVoiceMode ? "- VOICE MODE: Very short phrases, natural spoken dates." : ""}
         return responseText;
 
     } catch (error) {
-        console.error("LLM ISOLATION ERROR:", error);
-        return "Estou com dificuldade em sincronizar a agenda agora. Vou pedir para o barbeiro confirmar manualmente. [PAUSE_AI]";
+        console.error("CRITICAL AI ERROR:", error);
+        return "Estou com dificuldade em sincronizar a agenda agora. Pode repetir o seu pedido? 🤖";
     }
 };
