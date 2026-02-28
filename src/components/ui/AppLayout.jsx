@@ -4,30 +4,22 @@ import { Menu } from 'lucide-react';
 import { SupportChat } from './SupportChat';
 
 export function AppLayout({ children }) {
-  // Conforme solicitado: Sidebar recolhida por padrão
-  const[isCollapsed, setIsCollapsed] = useState(true);
+  const [isCollapsed, setIsCollapsed] = useState(true);
   const [isMobileOpen, setIsMobileOpen] = useState(false);
 
   return (
-    // Fundo cinza ultraclaro, estilo Avec
-    <div className="flex h-screen w-full bg-[#f4f5f7] text-gray-800 font-sans overflow-hidden">
+    <div className="flex h-screen w-full bg-schedy-canvas text-schedy-black font-sans overflow-hidden">
       
-      {/* Overlay Mobile */}
       {isMobileOpen && (
         <div 
-          className="fixed inset-0 bg-black/40 z-40 lg:hidden"
+          className="fixed inset-0 bg-schedy-black/20 backdrop-blur-sm z-[60] lg:hidden"
           onClick={() => setIsMobileOpen(false)}
         />
       )}
 
-      {/* 
-          SIDEBAR (ESTRUTURA FÍSICA)
-          No desktop (lg), ela NÃO é fixed. Ela está no fluxo Flex, o que garante 
-          que o calendário comece exatamente onde ela termina.
-      */}
       <aside 
         className={`
-          bg-white border-r border-gray-200 z-50 flex-shrink-0 transition-all duration-300
+          bg-white border-r border-schedy-border z-50 flex-shrink-0 transition-all duration-300
           ${isMobileOpen ? 'fixed inset-y-0 left-0 h-full w-[260px]' : 'hidden lg:block h-full'}
           ${isCollapsed ? 'lg:w-[72px]' : 'lg:w-[240px]'}
         `}
@@ -39,32 +31,32 @@ export function AppLayout({ children }) {
         />
       </aside>
       
-      {/* 
-          ÁREA PRINCIPAL (CALENDÁRIO)
-          Ocupa flex-1 (todo o resto da tela). Sem margens flutuantes.
-      */}
       <main className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
         
-        {/* Header Mobile */}
-        <div className="lg:hidden h-14 bg-white border-b border-gray-200 flex items-center justify-between px-4 shrink-0 z-30">
+        <div className="lg:hidden h-14 bg-white border-b border-schedy-border flex items-center justify-between px-4 shrink-0 z-30">
           <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-indigo-600 text-white rounded flex items-center justify-center font-bold italic text-xs">
+            <div className="w-8 h-8 bg-schedy-black text-white rounded flex items-center justify-center font-black italic text-xs">
               S
             </div>
-            <span className="font-bold text-lg tracking-tight text-indigo-600">SCHEDY</span>
+            <span className="font-black text-lg tracking-tighter text-schedy-black">SCHEDY</span>
           </div>
-          <button onClick={() => setIsMobileOpen(true)} className="p-2 text-gray-600">
+          <button onClick={() => setIsMobileOpen(true)} className="p-2 text-schedy-black">
             <Menu size={24} />
           </button>
         </div>
 
-        {/* CONTAINER DO DASHBOARD - Paddings mínimos para aproveitamento máximo */}
-        <div className="flex-1 overflow-hidden p-2 md:p-3">
+        {/* 
+            O SEGREDO ESTÁ AQUI: flex-1 flex flex-col
+            Isso permite que o Dashboard assuma 100% do espaço restante e trave o calendário
+        */}
+        <div className="flex-1 flex flex-col overflow-y-auto p-2 md:p-4 custom-scrollbar">
           {children}
         </div>
       </main>
 
-      <SupportChat />
+      <div className="relative z-[100]">
+        <SupportChat />
+      </div>
     </div>
   );
 }
